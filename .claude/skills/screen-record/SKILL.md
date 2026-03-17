@@ -49,21 +49,33 @@ writer.close()
 print("done:", output)
 ```
 
-### 3. 读取飞书配置
+### 3. 上传并发送视频（curl）
+
+从 `.env` 读取配置后，用 curl 完成上传和发送：
 
 ```bash
-grep -E "FEISHU_APP_ID|FEISHU_APP_SECRET|FEISHU_RECEIVE_USER_ID|FEISHU_RECEIVE_ID_TYPE" .env
-```
+APP_ID=$(grep FEISHU_APP_ID .env | cut -d= -f2)
+APP_SECRET=$(grep FEISHU_APP_SECRET .env | cut -d= -f2)
+RECEIVE_ID=$(grep "^FEISHU_RECEIVE_USER_ID" .env | cut -d= -f2)
+RECEIVE_ID_TYPE=$(grep "^FEISHU_RECEIVE_ID_TYPE" .env | cut -d= -f2)
 
-### 4. 上传并发送视频
+TOKEN=$(curl -s -X POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal \
+  -H "Content-Type: application/json" \
+  -d "{\"app_id\":\"$APP_ID\",\"app_secret\":\"$APP_SECRET\"}" \
+  | python -c "import sys,json; print(json.load(sys.stdin)['tenant_access_token'])")
 
-```javascript
-const form = new FormData();
-form.append('file_type', 'stream');  // 必须用 stream，否则报类型不匹配
-form.append('file_name', 'screen_record.mp4');
-form.append('file', new Blob([fs.readFileSync('C:/tmp/screen_record.mp4')], { type: 'video/mp4' }), 'screen_record.mp4');
-// POST https://open.feishu.cn/open-apis/im/v1/files 上传，取 file_key
-// 发送时 msg_type 用 "file"，content: JSON.stringify({ file_key })
+FILE_KEY=$(curl -s -X POST https://open.feishu.cn/open-apis/im/v1/files \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file_type=stream" \
+  -F "file_name=screen_record.mp4" \
+  -F "file=@C:/tmp/screen_record.mp4;type=video/mp4" \
+  | python -c "import sys,json; d=json.load(sys.stdin); print(d['data']['file_key']) if d.get('code')==0 else (_ for _ in ()).throw(Exception(d.get('msg')))")
+
+curl -s -X POST "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=$RECEIVE_ID_TYPE" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"receive_id\":\"$RECEIVE_ID\",\"msg_type\":\"file\",\"content\":\"{\\\"file_key\\\":\\\"$FILE_KEY\\\"}\"}" \
+  | python -c "import sys,json; d=json.load(sys.stdin); print('sent') if d.get('code')==0 else (_ for _ in ()).throw(Exception(d.get('msg')))"
 ```
 
 ## 注意事项
@@ -71,3 +83,4 @@ form.append('file', new Blob([fs.readFileSync('C:/tmp/screen_record.mp4')], { ty
 - 录制时务必后台运行，等完成通知后再上传
 - 飞书上传必须用 `file_type: stream`，msg_type 用 `file`
 - 输出路径固定为 `C:/tmp/screen_record.mp4`
+- **不要用 Node.js fetch 上传文件**：在 MINGW64/Windows 环境下大文件 fetch 会报 `fetch failed`，用 curl 更稳定
