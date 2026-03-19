@@ -65,11 +65,15 @@ function getTabTemplate(templateId) {
   return TAB_TEMPLATES.find(t => t.id === templateId) || null;
 }
 
-function ensureTabState(tabId) {
-  if (!tabState[tabId]) {
-    tabState[tabId] = { pty: null, scrollback: '', status: 'idle' };
-  }
-  return tabState[tabId];
+function createTabState(tab) {
+  return {
+    pty: null,
+    scrollback: '',
+    status: 'idle',
+    args: [...(tab.args || [])],
+    cols: null,
+    rows: null,
+  };
 }
 
 function serializeTab(tab) {
@@ -138,11 +142,7 @@ function removeRuntimeTab(tabId) {
   const index = TABS.findIndex(tab => tab.id === tabId);
   if (index === -1) return { error: 'Tab not found' };
   const [tab] = TABS.splice(index, 1);
-  const state = tabState[tabId];
-  if (state && state.pty) {
-    try { state.pty.kill(); } catch {}
-  }
-  delete tabState[tabId];
+  removeTabStateFromAllClients(tabId);
   persistRuntimeTabs();
   return { tabId: tab.id };
 }
@@ -234,19 +234,52 @@ function registerRuntimeTabFromSource(source, options = {}) {
   });
   tab.args = stripRuntimeResumeArgs(tab.args);
   TABS.push(tab);
-  ensureTabState(tab.id);
   persistRuntimeTabs();
   return { tab };
 }
 
-// Per-tab state
-const tabState = {};
-for (const tab of TABS) {
-  ensureTabState(tab.id);
+function ensureClientSession(ws) {
+  if (!ws.__ccTerminalSession) {
+    ws.__ccTerminalSession = { tabs: Object.create(null) };
+  }
+  return ws.__ccTerminalSession;
 }
 
-function appendScrollback(tabId, data) {
-  const state = tabState[tabId];
+function ensureTabState(ws, tabId) {
+  const tab = getTab(tabId);
+  if (!tab) return null;
+  const session = ensureClientSession(ws);
+  if (!session.tabs[tabId]) {
+    session.tabs[tabId] = createTabState(tab);
+  }
+  return session.tabs[tabId];
+}
+
+function destroyTabState(state) {
+  if (!state || !state.pty) return;
+  try { state.pty.kill(); } catch {}
+  state.pty = null;
+}
+
+function removeTabStateFromAllClients(tabId) {
+  for (const client of clients) {
+    const session = ensureClientSession(client);
+    const state = session.tabs[tabId];
+    if (!state) continue;
+    destroyTabState(state);
+    delete session.tabs[tabId];
+  }
+}
+
+function destroyClientSession(ws) {
+  const session = ensureClientSession(ws);
+  for (const state of Object.values(session.tabs)) {
+    destroyTabState(state);
+  }
+  session.tabs = Object.create(null);
+}
+
+function appendScrollback(state, data) {
   if (!state) return;
   state.scrollback += data;
   if (state.scrollback.length > MAX_SCROLLBACK) {
@@ -254,10 +287,32 @@ function appendScrollback(tabId, data) {
   }
 }
 
-function spawnTab(tabId, cols, rows) {
+function normalizeTerminalSize(cols, rows, fallbackCols, fallbackRows) {
+  const nextCols = Math.max(cols || fallbackCols || 120, 10);
+  const nextRows = Math.max(rows || fallbackRows || 40, 5);
+  return { cols: nextCols, rows: nextRows };
+}
+
+function resizeTab(state, cols, rows) {
+  if (!state || !state.pty) return false;
+  const nextSize = normalizeTerminalSize(cols, rows, state.cols, state.rows);
+  if (state.cols === nextSize.cols && state.rows === nextSize.rows) return false;
+  state.pty.resize(nextSize.cols, nextSize.rows);
+  state.cols = nextSize.cols;
+  state.rows = nextSize.rows;
+  return true;
+}
+
+function sendMessage(ws, msg) {
+  if (ws.readyState === 1) ws.send(JSON.stringify(msg));
+}
+
+function spawnTab(ws, tabId, cols, rows) {
   const tab = getTab(tabId);
-  const state = ensureTabState(tabId);
+  const state = ensureTabState(ws, tabId);
   if (!tab || !state || state.pty) return;
+  const tabArgs = [...(state.args || tab.args || [])];
+  const initialSize = normalizeTerminalSize(cols, rows, state.cols, state.rows);
 
   let spawnCmd, spawnArgs;
   const isPowerShellTab = tab.cmd === 'pwsh' || tab.cmd === 'pwsh.exe';
@@ -267,7 +322,7 @@ function spawnTab(tabId, cols, rows) {
       spawnArgs = ['-NoLogo', '-NoExit'];
     } else {
       spawnCmd = 'pwsh.exe';
-      const initCmd = `[Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${tab.cmd} ${tab.args.join(' ')}`;
+      const initCmd = `[Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Clear-Host; ${tab.cmd} ${tabArgs.join(' ')}`;
       spawnArgs = ['-NoLogo', '-NoExit', '-Command', initCmd];
     }
   } else {
@@ -276,39 +331,41 @@ function spawnTab(tabId, cols, rows) {
       spawnArgs = ['-NoLogo'];
     } else {
       spawnCmd = 'bash';
-      spawnArgs = ['-c', `${tab.cmd} ${tab.args.join(' ')}`];
+      spawnArgs = ['-c', `${tab.cmd} ${tabArgs.join(' ')}`];
     }
   }
 
   try {
     state.pty = pty.spawn(spawnCmd, spawnArgs, {
       name: 'xterm-256color',
-      cols: Math.max(cols || 120, 10),
-      rows: Math.max(rows || 40, 5),
+      cols: initialSize.cols,
+      rows: initialSize.rows,
       cwd: CWD,
       env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
     });
 
     state.status = 'running';
-    broadcast({ type: 'status', tab: tabId, status: 'running' });
+    state.cols = initialSize.cols;
+    state.rows = initialSize.rows;
+    sendMessage(ws, { type: 'status', tab: tabId, status: 'running' });
 
     state.pty.onData((data) => {
-      appendScrollback(tabId, data);
-      broadcast({ type: 'output', tab: tabId, data });
+      appendScrollback(state, data);
+      sendMessage(ws, { type: 'output', tab: tabId, data });
     });
 
     state.pty.onExit(() => {
       console.log(`[PTY] ${tab.label} exited`);
       state.pty = null;
       state.status = 'stopped';
-      broadcast({ type: 'exit', tab: tabId });
+      sendMessage(ws, { type: 'exit', tab: tabId });
     });
 
-    console.log(`[PTY] Spawned ${tab.label}: ${tab.cmd} ${tab.args.join(' ')}`);
+    console.log(`[PTY] Spawned ${tab.label}: ${tab.cmd} ${tabArgs.join(' ')}`);
   } catch (e) {
     console.error(`[PTY] Failed to spawn ${tab.label}:`, e.message);
     state.status = 'error';
-    broadcast({ type: 'status', tab: tabId, status: 'error' });
+    sendMessage(ws, { type: 'status', tab: tabId, status: 'error' });
   }
 }
 
@@ -375,7 +432,11 @@ const TERMINAL_HTML = `<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-system,'SF Pro Text','Segoe UI',sans-serif}
 
-#app{display:flex;flex-direction:column;position:fixed;inset:0}
+#app{
+  display:flex;flex-direction:column;position:fixed;inset:0;
+  --mobile-compose-offset:0px;
+  --mobile-compose-height:0px;
+}
 
 /* Header with tabs */
 #header{
@@ -445,28 +506,21 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
   box-shadow:0 10px 24px rgba(0,0,0,0.28);
   pointer-events:none;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
 }
-.yolo-btn{
-  font-size:11px;padding:2px 8px;border-radius:10px;cursor:pointer;
-  border:1px solid rgba(251,191,36,0.3);background:rgba(251,191,36,0.08);color:#888;
-  transition:all 0.2s;font-weight:700;letter-spacing:0.5px;
-}
-.yolo-btn:hover{border-color:rgba(251,191,36,0.5)}
-.yolo-btn.on{background:rgba(251,191,36,0.2);color:#fbbf24;border-color:#fbbf24;text-shadow:0 0 8px rgba(251,191,36,0.4)}
 /* Terminal area */
 #terminal-wrap{flex:1;min-height:0;position:relative;overflow:hidden;padding-top:6px}
-.term-panel{position:absolute;top:6px;right:0;bottom:0;left:0;display:none;overflow:hidden}
+.term-panel{position:absolute;top:6px;right:0;bottom:0;left:8px;display:none;overflow:hidden}
 .term-panel.active{display:block}
 .term-panel .xterm{height:100%!important}
 .term-panel .xterm-screen{height:100%!important}
-.term-panel,.term-panel .xterm,.term-panel .xterm-screen,.xterm-viewport{touch-action:pan-y}
-.xterm-viewport{overflow-y:auto!important}
+.term-panel,.term-panel .xterm,.term-panel .xterm-screen,.xterm-viewport{touch-action:pan-y!important}
+.xterm-viewport{overflow-y:auto!important;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
 .xterm-viewport::-webkit-scrollbar{width:6px}
 .xterm-viewport::-webkit-scrollbar-thumb{background:rgba(233,69,96,0.3);border-radius:3px}
-.xterm-cursor-layer{opacity:0!important}
-.xterm .xterm-helper-textarea{
-  caret-color:transparent!important;
-  color:transparent!important;
-  background:transparent!important;
+.xterm .composition-view{
+  background:transparent;
+  color:#e0e0e0;
+  border-bottom:1px solid rgba(233,69,96,0.45);
+  pointer-events:none;
 }
 
 /* Overlay */
@@ -486,19 +540,19 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
 #overlay button:active{transform:scale(0.97)}
 
 #scroll-bottom-btn{
-  position:absolute;right:16px;bottom:16px;z-index:6;
+  position:absolute;left:50%;bottom:16px;z-index:6;
   width:42px;height:42px;border-radius:999px;
   border:1px solid rgba(148,163,184,0.35);
   background:rgba(248,250,252,0.96);color:#111827;
   display:flex;align-items:center;justify-content:center;
   cursor:pointer;box-shadow:0 10px 24px rgba(0,0,0,0.28);
-  opacity:0;transform:translateY(10px) scale(0.96);pointer-events:none;
+  opacity:0;transform:translateX(-50%) translateY(10px) scale(0.96);pointer-events:none;
   transition:opacity 0.18s,transform 0.18s,box-shadow 0.18s,background 0.18s;
   backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
 }
-#scroll-bottom-btn.show{opacity:1;transform:translateY(0) scale(1);pointer-events:auto}
+#scroll-bottom-btn.show{opacity:1;transform:translateX(-50%) translateY(0) scale(1);pointer-events:auto}
 #scroll-bottom-btn:hover{background:#fff;box-shadow:0 12px 28px rgba(0,0,0,0.34)}
-#scroll-bottom-btn:active{transform:translateY(1px) scale(0.96)}
+#scroll-bottom-btn:active{transform:translateX(-50%) translateY(1px) scale(0.96)}
 #scroll-bottom-btn svg{width:20px;height:20px;display:block}
 
 /* Mobile bar — hidden on desktop */
@@ -515,7 +569,16 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
   .header-right{gap:4px;padding:0 8px}
   .tab-action-btn{min-width:26px;height:26px;padding:0 6px}
   .tab-template-menu{min-width:152px;max-width:calc(100vw - 12px)}
-  #scroll-bottom-btn{right:12px;bottom:12px;width:44px;height:44px}
+  #scroll-bottom-btn{bottom:12px;width:44px;height:44px}
+  .term-panel .xterm-screen,.term-panel .xterm-screen *{pointer-events:none}
+  .xterm .xterm-helper-textarea.ios-inline-ime{
+    opacity:1!important;z-index:6!important;
+    color:#e0e0e0!important;-webkit-text-fill-color:#e0e0e0!important;caret-color:#e0e0e0!important;
+    background:transparent!important;border:none!important;outline:none!important;
+    box-shadow:none!important;clip:auto!important;clip-path:none!important;
+    white-space:pre!important;overflow:hidden!important;pointer-events:none!important;
+  }
+  .xterm .composition-view.ios-inline-ime-hidden{display:none!important}
 
   #mobile-bar{
     display:flex;flex-direction:column;gap:6px;
@@ -586,10 +649,6 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
     color:#fff;border-color:#1a1a1e;
   }
   .qk-backspace svg{width:18px;height:18px;display:block}
-  .mobile-row-ctrlc .yolo-btn{
-    min-height:26px;padding:4px 12px;border-radius:5px;
-    display:flex;align-items:center;justify-content:center;
-  }
   #status-indicator.in-mobile-bar{
     position:absolute;right:0;top:50%;bottom:auto;left:auto;
     transform:translateY(-50%);
@@ -720,15 +779,19 @@ if (isStandalonePwa) document.documentElement.setAttribute('data-display-mode', 
 
 var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
   || (window.matchMedia('(pointer: coarse)').matches && window.innerWidth <= 768);
+var isIOS = /iPad|iPhone|iPod/i.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 // ===== Build header tabs =====
 var headerEl = document.getElementById('header');
 var rightEl = document.createElement('div');
 rightEl.className = 'header-right';
-rightEl.innerHTML = '<div class="tab-actions"><button class="tab-action-btn plus" id="add-tab-btn" type="button" title="复制当前标签页" aria-label="复制当前标签页">+</button><button class="tab-action-btn caret" id="add-tab-menu-btn" type="button" title="从模板新建标签页" aria-label="从模板新建标签页">▾</button><div class="tab-template-menu" id="tab-template-menu"></div></div><button class="yolo-btn" id="yolo-btn">YOLO</button>';
+rightEl.innerHTML = '<div class="tab-actions"><button class="tab-action-btn plus" id="add-tab-btn" type="button" title="复制当前标签页" aria-label="复制当前标签页">+</button><button class="tab-action-btn caret" id="add-tab-menu-btn" type="button" title="从模板新建标签页" aria-label="从模板新建标签页">▾</button><div class="tab-template-menu" id="tab-template-menu"></div></div>';
 headerEl.appendChild(rightEl);
 // ===== Build xterm instances =====
+var appEl = document.getElementById('app');
 var wrapEl = document.getElementById('terminal-wrap');
+var mobileBarEl = document.getElementById('mobile-bar');
 var scrollBottomBtnEl = document.getElementById('scroll-bottom-btn');
 var addTabBtnEl = document.getElementById('add-tab-btn');
 var addTabMenuBtnEl = document.getElementById('add-tab-menu-btn');
@@ -736,6 +799,7 @@ var tabTemplateMenuEl = document.getElementById('tab-template-menu');
 var terms = {};
 var fitAddons = {};
 var panels = {};
+var activatedTabs = Object.create(null);
 var lastTouchActionAt = 0;
 var lastRenameActionAt = 0;
 
@@ -855,6 +919,7 @@ function removeMountedTab(tabId) {
   }
   delete terms[tabId];
   delete fitAddons[tabId];
+  delete activatedTabs[tabId];
   if (panels[tabId]) panels[tabId].remove();
   delete panels[tabId];
   var tabEl = headerEl.querySelector('.tab[data-tab="' + tabId + '"]');
@@ -977,6 +1042,7 @@ headerEl.addEventListener('scroll', function() {
 
 function getTermTextarea(term) {
   if (!term) return null;
+  if (term.__ccTextarea) return term.__ccTextarea;
   if (term.textarea) return term.textarea;
   if (term.element) return term.element.querySelector('.xterm-helper-textarea');
   return null;
@@ -987,46 +1053,81 @@ function getTermViewport(term) {
   return term.element.querySelector('.xterm-viewport');
 }
 
-function suppressNativeCaret(term) {
-  var textarea = getTermTextarea(term);
-  if (!textarea) return;
-  textarea.style.caretColor = 'transparent';
-  textarea.style.color = 'transparent';
-  textarea.style.background = 'transparent';
-  textarea.setAttribute('autocapitalize', 'off');
-  textarea.setAttribute('autocomplete', 'off');
-  textarea.setAttribute('autocorrect', 'off');
-  textarea.spellcheck = false;
+function getTermCompositionView(term) {
+  if (!term || !term.element) return null;
+  return term.element.querySelector('.composition-view');
 }
 
-function blurTerm(term) {
-  if (!term) return;
-  if (typeof term.blur === 'function') {
-    term.blur();
-    return;
-  }
-  var textarea = getTermTextarea(term);
-  if (textarea && typeof textarea.blur === 'function') textarea.blur();
-}
-
-function focusTermTextarea(term) {
-  var textarea = getTermTextarea(term);
-  if (!textarea) return;
-  textarea.readOnly = false;
-  textarea.disabled = false;
-  textarea.setAttribute('inputmode', 'text');
-  textarea.setAttribute('enterkeyhint', 'enter');
+function refreshTabViewport(tabId) {
+  var term = terms[tabId];
+  var panel = panels[tabId];
+  if (!term || !panel || !panel.classList.contains('active')) return;
   try {
-    textarea.focus({ preventScroll: true });
-  } catch (err) {
-    try { textarea.focus(); } catch (focusErr) {}
+    term.refresh(0, Math.max((term.rows || 1) - 1, 0));
+  } catch (err) {}
+  scheduleScrollBottomButtonUpdate();
+}
+
+function scheduleTabViewportRefresh(tabId) {
+  requestAnimationFrame(function() {
+    refreshTabViewport(tabId);
+  });
+}
+
+function updateMobileCompositionMetrics() {
+}
+
+function setIOSInlineImeState(textarea, composing) {
+  if (!isIOS || !textarea) return;
+  textarea.classList.toggle('ios-inline-ime', composing);
+  var term = textarea.__ccTerm || null;
+  var compositionView = term ? getTermCompositionView(term) : null;
+  if (compositionView) compositionView.classList.toggle('ios-inline-ime-hidden', composing);
+}
+
+function setMobileComposingState(textarea, composing) {
+  setIOSInlineImeState(textarea, composing);
+}
+
+function syncMobileCompositionTextarea(textarea) {
+  if (!isIOS || !textarea || !textarea.classList.contains('ios-inline-ime')) return;
+  setIOSInlineImeState(textarea, true);
+}
+
+function shouldUseMobileTextareaBridge(tab) {
+  return false;
+}
+
+function getMobileTextareaBridgeState(term) {
+  if (!term.__ccMobileBridgeState) {
+    term.__ccMobileBridgeState = { pendingEchoes: [] };
   }
-  if (typeof textarea.setSelectionRange === 'function') {
-    try {
-      var value = textarea.value || '';
-      textarea.setSelectionRange(value.length, value.length);
-    } catch (rangeErr) {}
-  }
+  return term.__ccMobileBridgeState;
+}
+
+function recordMobileBridgeDispatch(term, data) {
+  if (!term || !data) return;
+  var bridgeState = getMobileTextareaBridgeState(term);
+  var now = Date.now();
+  bridgeState.pendingEchoes = bridgeState.pendingEchoes.filter(function(item) {
+    return item.expiresAt > now;
+  });
+  bridgeState.pendingEchoes.push({ data: data, expiresAt: now + 240 });
+}
+
+function consumeMobileBridgeEcho(term, data) {
+  if (!term || !data || !term.__ccMobileBridgeState) return false;
+  var bridgeState = term.__ccMobileBridgeState;
+  var now = Date.now();
+  bridgeState.pendingEchoes = bridgeState.pendingEchoes.filter(function(item) {
+    return item.expiresAt > now;
+  });
+  var index = bridgeState.pendingEchoes.findIndex(function(item) {
+    return item.data === data;
+  });
+  if (index === -1) return false;
+  bridgeState.pendingEchoes.splice(index, 1);
+  return true;
 }
 
 function installMobileTextareaBridge(term, tabId) {
@@ -1048,12 +1149,13 @@ function installMobileTextareaBridge(term, tabId) {
         textarea.setSelectionRange(0, 0);
       } catch (rangeErr) {}
     }
+    syncMobileCompositionTextarea(textarea);
   }
 
   function recentlyDispatched(text) {
     return !!text
       && bridgeState.lastDispatchedText === text
-      && (Date.now() - bridgeState.lastDispatchAt) < 120;
+      && (Date.now() - bridgeState.lastDispatchAt) < 240;
   }
 
   function dispatchTextareaText(text) {
@@ -1067,12 +1169,14 @@ function installMobileTextareaBridge(term, tabId) {
     }
     bridgeState.lastDispatchedText = text;
     bridgeState.lastDispatchAt = Date.now();
+    recordMobileBridgeDispatch(term, text);
     sendRaw(tabId, text);
     clearTextareaValue();
     requestActiveTermFocus();
   }
 
   function dispatchControlInput(data) {
+    recordMobileBridgeDispatch(term, data);
     sendRaw(tabId, data);
     clearTextareaValue();
     requestActiveTermFocus();
@@ -1086,11 +1190,17 @@ function installMobileTextareaBridge(term, tabId) {
     bridgeState.composing = false;
     if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
     dispatchTextareaText((e && e.data) || textarea.value || '');
+    requestAnimationFrame(function() {
+      setMobileComposingState(textarea, false);
+    });
   }, true);
 
   textarea.addEventListener('beforeinput', function(e) {
     if (!e) return;
-    if (e.inputType === 'insertCompositionText') return;
+    if (e.inputType === 'insertCompositionText') {
+      syncMobileCompositionTextarea(textarea);
+      return;
+    }
     if (e.inputType === 'deleteCompositionText') {
       if (typeof e.stopPropagation === 'function') e.stopPropagation();
       clearTextareaValue();
@@ -1111,7 +1221,10 @@ function installMobileTextareaBridge(term, tabId) {
     if (e.inputType === 'insertText'
       || e.inputType === 'insertReplacementText'
       || e.inputType === 'insertFromComposition') {
-      if (bridgeState.composing && e.inputType !== 'insertFromComposition') return;
+      if (bridgeState.composing && e.inputType !== 'insertFromComposition') {
+        syncMobileCompositionTextarea(textarea);
+        return;
+      }
       var text = e.data || textarea.value || '';
       if (!text) return;
       e.preventDefault();
@@ -1119,6 +1232,46 @@ function installMobileTextareaBridge(term, tabId) {
       dispatchTextareaText(text);
     }
   }, true);
+}
+
+function suppressNativeCaret(term) {
+  var textarea = getTermTextarea(term);
+  if (!textarea) return;
+  textarea.setAttribute('autocapitalize', 'off');
+  textarea.setAttribute('autocomplete', 'off');
+  textarea.setAttribute('autocorrect', 'off');
+  textarea.spellcheck = false;
+}
+
+function blurTerm(term) {
+  if (!term) return;
+  var textarea = getTermTextarea(term);
+  if (textarea) setMobileComposingState(textarea, false);
+  if (typeof term.blur === 'function') {
+    term.blur();
+    return;
+  }
+  if (textarea && typeof textarea.blur === 'function') textarea.blur();
+}
+
+function focusTermTextarea(term) {
+  var textarea = getTermTextarea(term);
+  if (!textarea) return;
+  textarea.readOnly = false;
+  textarea.disabled = false;
+  textarea.setAttribute('inputmode', 'text');
+  textarea.setAttribute('enterkeyhint', 'enter');
+  try {
+    textarea.focus({ preventScroll: true });
+  } catch (err) {
+    try { textarea.focus(); } catch (focusErr) {}
+  }
+  if (typeof textarea.setSelectionRange === 'function') {
+    try {
+      var value = textarea.value || '';
+      textarea.setSelectionRange(value.length, value.length);
+    } catch (rangeErr) {}
+  }
 }
 
 function focusTermOnce(term) {
@@ -1214,6 +1367,7 @@ function mountTab(tab) {
   panel.id = 'panel-' + t.id;
   wrapEl.insertBefore(panel, document.getElementById('overlay'));
   panels[t.id] = panel;
+  var isCompactCodexMobile = isMobile && (t.templateId === 'codex' || t.cmd === 'codex');
 
   var term = new window.Terminal({
     cursorBlink: false,
@@ -1221,15 +1375,14 @@ function mountTab(tab) {
     cursorWidth: 1,
     cursorInactiveStyle: 'none',
     fontSize: isMobile ? 11 : 14,
-    fontFamily: isMobile
-      ? "'ui-monospace','SFMono-Regular','SF Mono','Cascadia Code','Menlo','Consolas',monospace,'Symbols Nerd Font Mono'"
-      : "'Cascadia Code','Fira Code','JetBrains Mono','Menlo','Consolas','Symbols Nerd Font Mono',monospace",
+    fontFamily: "'Cascadia Code','Fira Code','JetBrains Mono','Menlo','Consolas','Symbols Nerd Font Mono',monospace",
     lineHeight: isMobile ? 1.05 : 1.15,
+    letterSpacing: isCompactCodexMobile ? -0.35 : 0,
     theme: {
       background: '#1a1a2e',
       foreground: '#e0e0e0',
-      cursor: 'transparent',
-      cursorAccent: 'transparent',
+      cursor: '#f8fafc',
+      cursorAccent: '#1a1a2e',
       selectionBackground: 'rgba(233,69,96,0.25)',
       selectionForeground: '#fff',
       black: '#1a1a2e', red: '#e94560', green: '#4ade80', yellow: '#fbbf24',
@@ -1248,8 +1401,39 @@ function mountTab(tab) {
   if (window.WebLinksAddon) term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
   term.open(panel);
   suppressNativeCaret(term);
-  installMobileTextareaBridge(term, t.id);
-  fit.fit();
+  var useMobileTextareaBridge = shouldUseMobileTextareaBridge(t);
+  if (isMobile) {
+    var ta = getTermTextarea(term);
+    if (ta) {
+      term.__ccTextarea = ta;
+      ta.__ccTerm = term;
+      ta.addEventListener('compositionstart', function() {
+        setMobileComposingState(ta, true);
+        scrollActiveTabToBottom();
+      }, true);
+      ta.addEventListener('compositionupdate', function() {
+        syncMobileCompositionTextarea(ta);
+      }, true);
+      ta.addEventListener('input', function() {
+        syncMobileCompositionTextarea(ta);
+      }, true);
+      ta.addEventListener('compositionend', function() {
+        if (!useMobileTextareaBridge) requestAnimationFrame(function() {
+          setMobileComposingState(ta, false);
+        });
+      }, true);
+      ta.addEventListener('blur', function() {
+        setMobileComposingState(ta, false);
+      }, true);
+    }
+    if (useMobileTextareaBridge) {
+      installMobileTextareaBridge(term, t.id);
+    }
+  }
+  if (t.id === activeTab) {
+    fit.fit();
+    activatedTabs[t.id] = true;
+  }
   terms[t.id] = term;
   fitAddons[t.id] = fit;
   term.onScroll(function() {
@@ -1272,6 +1456,7 @@ function mountTab(tab) {
 
   // Keyboard input (both desktop and mobile)
   term.onData(function(data) {
+    if (shouldUseMobileTextareaBridge(t) && consumeMobileBridgeEcho(term, data)) return;
     sendRaw(t.id, data);
   });
   return t;
@@ -1293,6 +1478,7 @@ function doFit() {
       }
     }
   } catch(e) {}
+  if (activeTab) scheduleTabViewportRefresh(activeTab);
   scheduleScrollBottomButtonUpdate();
 }
 requestAnimationFrame(doFit);
@@ -1303,6 +1489,7 @@ if (document.fonts && document.fonts.ready) document.fonts.ready.then(doFit);
 var resizeTimer;
 window.addEventListener('resize', function() {
   clearTimeout(resizeTimer);
+  if (isMobile) updateMobileCompositionMetrics();
   resizeTimer = setTimeout(doFit, 150);
 });
 
@@ -1318,14 +1505,19 @@ function switchTab(tabId) {
     panels[id].classList.toggle('active', id === tabId);
   });
   setTimeout(function() {
+    if (!activatedTabs[tabId] && terms[tabId] && typeof terms[tabId].reset === 'function') {
+      terms[tabId].reset();
+      activatedTabs[tabId] = true;
+    }
     fitAddons[tabId].fit();
+    if (ws && ws.readyState === 1) {
+      var t = terms[tabId];
+      ws.send(JSON.stringify({ type: 'activate', tab: tabId, cols: t.cols, rows: t.rows }));
+    }
     syncActiveTermFocus(!isMobile);
+    scheduleTabViewportRefresh(tabId);
     scheduleScrollBottomButtonUpdate();
   }, 50);
-  if (ws && ws.readyState === 1) {
-    var t = terms[tabId];
-    ws.send(JSON.stringify({ type: 'activate', tab: tabId, cols: t.cols, rows: t.rows }));
-  }
 }
 
 // ===== WebSocket =====
@@ -1416,15 +1608,18 @@ function connect() {
       } else if (msg.type === 'tab_error') {
         if (pendingCreatedTabId && msg.id === pendingCreatedTabId) pendingCreatedTabId = null;
         showToast(msg.message || '新建标签页失败', 'error', 3000);
-      } else if (msg.type === 'output' || msg.type === 'scrollback') {
+      } else if (msg.type === 'scrollback') {
+        if (terms[msg.tab]) {
+          if (typeof terms[msg.tab].reset === 'function') terms[msg.tab].reset();
+          terms[msg.tab].write(msg.data);
+        }
+        scheduleScrollBottomButtonUpdate();
+      } else if (msg.type === 'output') {
         if (terms[msg.tab]) terms[msg.tab].write(msg.data);
         scheduleScrollBottomButtonUpdate();
       } else if (msg.type === 'clear') {
         if (terms[msg.tab]) terms[msg.tab].clear();
         scheduleScrollBottomButtonUpdate();
-      } else if (msg.type === 'yolo') {
-        var yoloBtn = document.getElementById('yolo-btn');
-        if (yoloBtn) yoloBtn.classList.toggle('on', msg.yolo);
       } else if (msg.type === 'exit') {
         if (terms[msg.tab]) {
           terms[msg.tab].write('\\r\\n\\x1b[31m[Session ended]\\x1b[0m\\r\\n');
@@ -1479,35 +1674,15 @@ scrollBottomBtnEl.addEventListener('click', function() {
 
 connect();
 
-// ===== YOLO button =====
-document.getElementById('yolo-btn').addEventListener('click', function() {
-  var btn = this;
-  var isOn = btn.classList.contains('on');
-  var newYolo = !isOn;
-  var yoloTab = (activeTab === 'codex') ? 'codex' : 'claude';
-  var yoloLabel = (yoloTab === 'codex') ? 'Codex' : 'Claude Code';
-  var yoloFlag = (yoloTab === 'codex') ? '--yolo' : '--dangerously-skip-permissions';
-  if (newYolo && !confirm('开启 YOLO 模式？\\n\\n' + yoloLabel + ' 将自动批准所有操作（' + yoloFlag + '）。\\n确认后会重启当前 ' + yoloLabel + ' 会话。')) return;
-  if (!newYolo && !confirm('关闭 YOLO 模式？\\n\\n确认后会重启当前 ' + yoloLabel + ' 会话。')) return;
-  var t = terms[yoloTab];
-  if (ws && ws.readyState === 1 && t) {
-    ws.send(JSON.stringify({ type: 'restart', tab: yoloTab, yolo: newYolo, cols: t.cols, rows: t.rows }));
-  }
-});
-
 // ===== Mobile =====
 if (isMobile) {
-  var appEl = document.getElementById('app');
-  var yoloBtnEl = document.getElementById('yolo-btn');
   var ctrlcBtnEl = document.getElementById('btn-ctrlc');
   var statusIndicatorEl = document.getElementById('status-indicator');
-  if (yoloBtnEl && ctrlcBtnEl && ctrlcBtnEl.parentNode) {
-    ctrlcBtnEl.parentNode.insertBefore(yoloBtnEl, ctrlcBtnEl);
-  }
   if (statusIndicatorEl && ctrlcBtnEl && ctrlcBtnEl.parentNode) {
     ctrlcBtnEl.parentNode.appendChild(statusIndicatorEl);
     statusIndicatorEl.classList.add('in-mobile-bar');
   }
+  updateMobileCompositionMetrics();
 
   // --- Keyboard handling via visualViewport ---
   if (window.visualViewport) {
@@ -1541,6 +1716,7 @@ if (isMobile) {
       }
       keyboardOpen = nextKeyboardOpen;
       lastVH = vh;
+      updateMobileCompositionMetrics();
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(doFit, 80);
     }
@@ -1552,7 +1728,8 @@ if (isMobile) {
   // --- Touch: scroll terminal + swipe to switch tabs ---
   var touchStartY = 0, lastTouchY = 0, touchDir = null;
   var termWrap = document.getElementById('terminal-wrap');
-  var SCROLL_PIXELS_PER_PIXEL = 1.2;
+  var SCROLL_PIXELS_PER_PIXEL = 2.2;
+  var SCROLL_FAST_SWIPE_BOOST = 0.9;
 
   termWrap.addEventListener('touchstart', function(e) {
     if (e.touches.length !== 1) return;
@@ -1574,18 +1751,16 @@ if (isMobile) {
     if (touchDir === 'v') {
       var term = terms[activeTab];
       if (!term) return;
+      var viewport = getTermViewport(term);
       var delta = lastTouchY - curY;
       if (Math.abs(delta) >= 1) {
-        var viewport = getTermViewport(term);
-        if (viewport) {
-          viewport.scrollTop += delta * SCROLL_PIXELS_PER_PIXEL;
-        } else {
-          term.scrollLines(Math.round(delta / 12));
-        }
+        e.preventDefault();
+        var speed = SCROLL_PIXELS_PER_PIXEL + Math.min(Math.abs(delta) / 18, SCROLL_FAST_SWIPE_BOOST);
+        if (viewport) viewport.scrollTop += delta * speed;
+        else term.scrollLines(Math.round(delta / 12));
         lastTouchY = curY;
         scheduleScrollBottomButtonUpdate();
       }
-      e.preventDefault();
     }
   }, { passive: false });
 
@@ -1959,6 +2134,7 @@ wss.on('connection', (ws, req) => {
   }
 
   clients.add(ws);
+  ensureClientSession(ws);
 
   ws.on('message', (raw) => {
     try {
@@ -1968,16 +2144,13 @@ wss.on('connection', (ws, req) => {
         const tabId = msg.tab;
         const tab = getTab(tabId);
         if (!tab) return;
-        const state = ensureTabState(tabId);
+        const state = ensureTabState(ws, tabId);
         if (!state.pty && state.status !== 'error') {
-          spawnTab(tabId, msg.cols, msg.rows);
+          spawnTab(ws, tabId, msg.cols, msg.rows);
         } else if (state.pty && msg.cols && msg.rows) {
-          state.pty.resize(Math.max(msg.cols, 10), Math.max(msg.rows, 5));
+          resizeTab(state, msg.cols, msg.rows);
         }
-        if (state.scrollback) {
-          ws.send(JSON.stringify({ type: 'scrollback', tab: tabId, data: state.scrollback }));
-        }
-        ws.send(JSON.stringify({ type: 'status', tab: tabId, status: state.status }));
+        sendMessage(ws, { type: 'status', tab: tabId, status: state.status });
       }
 
       if (msg.type === 'create_tab') {
@@ -2035,56 +2208,28 @@ wss.on('connection', (ws, req) => {
         }
       }
 
-      if (msg.type === 'restart') {
-        const tabId = msg.tab;
-        const tab = getTab(tabId);
-        const state = ensureTabState(tabId);
-        if (!tab || !state) return;
-        // Kill existing pty
-        if (state.pty) {
-          state.pty.kill();
-          state.pty = null;
-        }
-        state.scrollback = '';
-        state.status = 'idle';
-        // Update args based on yolo flag
-        if (msg.yolo !== undefined) {
-          if (tab.cmd === 'claude') {
-            const baseArgs = (tab.args || []).filter(a => a !== '--dangerously-skip-permissions');
-            tab.args = msg.yolo ? [...baseArgs, '--dangerously-skip-permissions'] : baseArgs;
-          } else if (tab.cmd === 'codex') {
-            const baseArgs = (tab.args || []).filter(a => a !== '--yolo');
-            tab.args = msg.yolo ? [...baseArgs, '--yolo'] : baseArgs;
-          }
-          persistRuntimeTabs();
-        }
-        // Clear terminal on all clients
-        broadcast({ type: 'clear', tab: tabId });
-        // Respawn
-        spawnTab(tabId, msg.cols, msg.rows);
-        // Send yolo state back
-        const isYolo = (tab.args || []).includes('--dangerously-skip-permissions') || (tab.args || []).includes('--yolo');
-        broadcast({ type: 'yolo', tab: tabId, yolo: isYolo });
-      }
-
       if (msg.type === 'input') {
         if (!getTab(msg.tab)) return;
-        const state = ensureTabState(msg.tab);
+        const state = ensureTabState(ws, msg.tab);
         if (state && state.pty) state.pty.write(msg.data);
       }
 
       if (msg.type === 'resize') {
-        if (!getTab(msg.tab)) return;
-        const state = ensureTabState(msg.tab);
-        if (state && state.pty) {
-          state.pty.resize(Math.max(msg.cols || 80, 10), Math.max(msg.rows || 24, 5));
-        }
+        const tabId = msg.tab;
+        if (!getTab(tabId)) return;
+        const state = ensureTabState(ws, tabId);
+        resizeTab(state, msg.cols || 80, msg.rows || 24);
       }
     } catch {}
   });
 
-  ws.on('close', () => clients.delete(ws));
-  ws.on('error', () => clients.delete(ws));
+  function handleClientDetach() {
+    destroyClientSession(ws);
+    clients.delete(ws);
+  }
+
+  ws.on('close', handleClientDetach);
+  ws.on('error', handleClientDetach);
 });
 
 server.listen(PORT, '127.0.0.1', () => {
@@ -2095,9 +2240,8 @@ server.listen(PORT, '127.0.0.1', () => {
 });
 
 process.on('SIGINT', () => {
-  for (const state of Object.values(tabState)) {
-    if (state.pty) state.pty.kill();
+  for (const client of clients) {
+    destroyClientSession(client);
   }
   process.exit(0);
 });
-
