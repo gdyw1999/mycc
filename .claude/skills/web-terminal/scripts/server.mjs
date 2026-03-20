@@ -1192,8 +1192,37 @@ function installMobileTextareaBridge(term, tabId) {
   var bridgeState = {
     composing: false,
     lastDispatchedText: '',
-    lastDispatchAt: 0
+    lastDispatchAt: 0,
+    compositionCommitted: false,
+    pendingCompositionText: '',
+    pendingCompositionTimer: 0
   };
+
+  function clearPendingCompositionFallback() {
+    if (bridgeState.pendingCompositionTimer) {
+      clearTimeout(bridgeState.pendingCompositionTimer);
+      bridgeState.pendingCompositionTimer = 0;
+    }
+    bridgeState.pendingCompositionText = '';
+  }
+
+  function markCompositionCommitted() {
+    bridgeState.compositionCommitted = true;
+    clearPendingCompositionFallback();
+  }
+
+  function scheduleCompositionFallback(text) {
+    clearPendingCompositionFallback();
+    if (!text || bridgeState.compositionCommitted) return;
+    bridgeState.pendingCompositionText = text;
+    bridgeState.pendingCompositionTimer = setTimeout(function() {
+      bridgeState.pendingCompositionTimer = 0;
+      var fallbackText = bridgeState.pendingCompositionText;
+      bridgeState.pendingCompositionText = '';
+      if (bridgeState.compositionCommitted || !fallbackText) return;
+      dispatchTextareaText(fallbackText);
+    }, 30);
+  }
 
   function clearTextareaValue() {
     textarea.value = '';
@@ -1229,6 +1258,7 @@ function installMobileTextareaBridge(term, tabId) {
   }
 
   function dispatchControlInput(data) {
+    markCompositionCommitted();
     recordMobileBridgeDispatch(term, data);
     sendRaw(tabId, data);
     clearTextareaValue();
@@ -1237,12 +1267,15 @@ function installMobileTextareaBridge(term, tabId) {
 
   textarea.addEventListener('compositionstart', function() {
     bridgeState.composing = true;
+    bridgeState.compositionCommitted = false;
+    clearPendingCompositionFallback();
   }, true);
 
   textarea.addEventListener('compositionend', function(e) {
     bridgeState.composing = false;
     if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
-    dispatchTextareaText((e && e.data) || textarea.value || '');
+    var text = (e && e.data) || textarea.value || '';
+    scheduleCompositionFallback(text);
     requestAnimationFrame(function() {
       setMobileComposingState(textarea, false);
     });
@@ -1274,7 +1307,7 @@ function installMobileTextareaBridge(term, tabId) {
     if (e.inputType === 'insertText'
       || e.inputType === 'insertReplacementText'
       || e.inputType === 'insertFromComposition') {
-      if (bridgeState.composing && e.inputType !== 'insertFromComposition') {
+      if ((e.isComposing || bridgeState.composing) && e.inputType !== 'insertFromComposition') {
         syncMobileCompositionTextarea(textarea);
         return;
       }
@@ -1282,6 +1315,7 @@ function installMobileTextareaBridge(term, tabId) {
       if (!text) return;
       e.preventDefault();
       if (typeof e.stopPropagation === 'function') e.stopPropagation();
+      markCompositionCommitted();
       dispatchTextareaText(text);
     }
   }, true);
@@ -1461,29 +1495,35 @@ function mountTab(tab) {
     term.__ccTextarea = ta;
     ta.__ccTerm = term;
     ta.addEventListener('compositionstart', function() {
-      setTermImeComposing(term, true);
-      if (isMobile) {
+      if (isMobile && useMobileTextareaBridge) {
         setMobileComposingState(ta, true);
         scrollActiveTabToBottom();
       }
     }, true);
     ta.addEventListener('compositionupdate', function() {
-      if (isMobile) syncMobileCompositionTextarea(ta);
+      if (isMobile && useMobileTextareaBridge) syncMobileCompositionTextarea(ta);
     }, true);
     ta.addEventListener('input', function() {
-      if (isMobile) syncMobileCompositionTextarea(ta);
+      if (isMobile && useMobileTextareaBridge) syncMobileCompositionTextarea(ta);
     }, true);
-    ta.addEventListener('compositionend', function() {
-      setTermImeComposing(term, false);
-      if (isMobile && !useMobileTextareaBridge) {
-        requestAnimationFrame(function() {
-          setMobileComposingState(ta, false);
-        });
+    ta.addEventListener('compositionend', function(e) {
+      if (!isMobile) {
+        // Desktop: use e.data (actual committed text) instead of ta.value (may be stale
+        // from candidate browsing). Clear textarea BEFORE xterm reads it to prevent
+        // xterm from double-sending or committing a cancelled/stale composition.
+        var composedText = (e && e.data) || '';
+        ta.value = '';
+        try { ta.setSelectionRange(0, 0); } catch (rnErr) {}
+        if (composedText) sendRaw(t.id, composedText);
+        return;
       }
+      if (!useMobileTextareaBridge) return;
+      requestAnimationFrame(function() {
+        setMobileComposingState(ta, false);
+      });
     }, true);
     ta.addEventListener('blur', function() {
-      setTermImeComposing(term, false);
-      if (isMobile) setMobileComposingState(ta, false);
+      if (isMobile && useMobileTextareaBridge) setMobileComposingState(ta, false);
     }, true);
   }
   var useMobileTextareaBridge = shouldUseMobileTextareaBridge(t);
@@ -1507,7 +1547,6 @@ function mountTab(tab) {
   (function(tabId, t) {
     t.attachCustomKeyEventHandler(function(e) {
       if (e.type !== 'keydown') return true;
-      if (e.isComposing || isTermImeComposing(t)) return true;
       if (e.key === 'Enter' && e.shiftKey) {
         e.preventDefault();
         sendRaw(tabId, '\\n');
@@ -1519,15 +1558,6 @@ function mountTab(tab) {
 
   // Keyboard input (both desktop and mobile)
   term.onData(function(data) {
-    if (isTermImeComposing(term)) return;
-    if (shouldUseMobileTextareaBridge(t)) {
-      var remaining = consumeMobileBridgeEcho(term, data);
-      if (remaining === '') return;
-      if (remaining !== null) {
-        if (remaining) sendRaw(t.id, remaining);
-        return;
-      }
-    }
     sendRaw(t.id, data);
   });
   return t;
