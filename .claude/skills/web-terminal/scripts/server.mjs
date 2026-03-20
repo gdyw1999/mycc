@@ -25,8 +25,8 @@ const NO_CACHE_HEADERS = {
 
 // Tab definitions
 const configuredTabs = [
-  { id: 'claude', label: 'Claude Code', cmd: 'claude', args: ['--continue'] },
-  { id: 'codex', label: 'Codex', cmd: 'codex', args: [] },
+  { id: 'claude', label: 'Claude Code', cmd: 'claude', args: ['--continue', '--dangerously-skip-permissions'] },
+  { id: 'codex', label: 'Codex', cmd: 'codex', args: ['resume', '--last', '--yolo'] },
 ];
 const EXTRA_TAB_TEMPLATES = [
   { id: 'pwsh', label: 'pwsh', cmd: 'pwsh', args: [] },
@@ -590,7 +590,6 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
   }
   .mobile-row::-webkit-scrollbar{display:none}
   .mobile-row-secondary{justify-content:center;overflow:visible}
-  .mobile-row-secondary #btn-esc{order:0}
   .mobile-row-arrows{justify-content:center;overflow:visible}
   .mobile-row-ctrlc{justify-content:center;overflow:visible;position:relative}
   .arrow-pad{
@@ -627,9 +626,24 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
     background:rgba(96,165,250,0.12);color:#60a5fa;border-color:rgba(96,165,250,0.25);
   }
   .qk-upload:active{background:#60a5fa;color:#000;border-color:#60a5fa}
-  .qk-arrow{background:rgba(168,85,247,0.12);color:#a855f7;border-color:rgba(168,85,247,0.25);min-width:36px;padding:6px 8px}
-  .qk-arrow:active{background:#a855f7;color:#fff;border-color:#a855f7}
+  .qk-arrow{
+    min-width:36px;padding:6px 8px;
+    background:linear-gradient(180deg,#50555d 0%,#2f343b 100%);
+    color:#d8dde7;
+    border:1px solid #1d2127;
+    border-radius:6px;
+    box-shadow:0 1px 0 1px #0d1014,0 -1px 0 0 #656b74 inset,0 2px 4px rgba(0,0,0,0.34);
+    text-shadow:0 1px 1px rgba(0,0,0,0.38);
+  }
+  .qk-arrow:active{
+    background:linear-gradient(180deg,#2b3036 0%,#3a4048 100%);
+    color:#f5f7fb;
+    border-color:#181c21;
+    box-shadow:0 0 0 1px #0d1014,0 1px 2px rgba(0,0,0,0.28) inset;
+    transform:translateY(1px) scale(0.97);
+  }
   .qk-nav{min-width:86px}
+  .qk-space{min-width:102px;padding:4px 16px}
   .qk-backspace{
     min-width:46px;padding:4px 10px;font-family:inherit;
     background:linear-gradient(180deg,#4a4a4f 0%,#2c2c30 100%);
@@ -736,7 +750,7 @@ html[data-display-mode="standalone"] #scroll-bottom-btn{
       </button>
     </div>
     <div class="mobile-row mobile-row-secondary">
-      <button class="qk qk-nav" id="btn-esc">Esc</button>
+      <button class="qk qk-space" id="btn-space">Space</button>
       <button class="qk" id="btn-newline">换行</button>
       <button class="qk" id="btn-del">Del</button>
       <button class="qk qk-nav" id="btn-shift-tab">Shift+Tab</button>
@@ -750,6 +764,7 @@ html[data-display-mode="standalone"] #scroll-bottom-btn{
       </div>
     </div>
     <div class="mobile-row mobile-row-ctrlc">
+      <button class="qk qk-nav" id="btn-esc">Esc</button>
       <button class="qk qk-stop" id="btn-ctrlc">Ctrl+C</button>
     </div>
   </div>
@@ -1899,6 +1914,12 @@ if (isMobile) {
   document.getElementById('btn-esc').addEventListener('touchstart', function(e) {
     e.preventDefault();
     sendMobileShortcut('\x1b');
+  }, { passive: false });
+
+  // --- Space button ---
+  document.getElementById('btn-space').addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    sendMobileShortcut(' ');
   }, { passive: false });
 
   // --- Shift+Tab button ---
