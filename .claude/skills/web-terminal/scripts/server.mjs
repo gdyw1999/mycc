@@ -17,11 +17,16 @@ const CWD = process.env.WEB_TERMINAL_CWD || process.cwd();
 const MAX_SCROLLBACK = 50 * 1024;
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024; // 50MB
 const RUNTIME_TABS_PATH = path.resolve(CWD, '.claude', 'skills', 'web-terminal', 'runtime-tabs.json');
+const NO_CACHE_HEADERS = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate',
+  Pragma: 'no-cache',
+  Expires: '0',
+};
 
 // Tab definitions
 const configuredTabs = [
-  { id: 'claude', label: 'Claude Code', cmd: 'claude', args: ['--continue'] },
-  { id: 'codex', label: 'Codex', cmd: 'codex', args: [] },
+  { id: 'claude', label: 'Claude Code', cmd: 'claude', args: ['--continue', '--dangerously-skip-permissions'] },
+  { id: 'codex', label: 'Codex', cmd: 'codex', args: ['resume', '--last', '--yolo'] },
 ];
 const EXTRA_TAB_TEMPLATES = [
   { id: 'pwsh', label: 'pwsh', cmd: 'pwsh', args: [] },
@@ -238,21 +243,16 @@ function registerRuntimeTabFromSource(source, options = {}) {
   return { tab };
 }
 
-function ensureClientSession(ws) {
-  if (!ws.__ccTerminalSession) {
-    ws.__ccTerminalSession = { tabs: Object.create(null) };
-  }
-  return ws.__ccTerminalSession;
-}
+// Global PTY sessions — persist across WebSocket reconnects
+const globalTabStates = Object.create(null);
 
-function ensureTabState(ws, tabId) {
+function getGlobalTabState(tabId) {
   const tab = getTab(tabId);
   if (!tab) return null;
-  const session = ensureClientSession(ws);
-  if (!session.tabs[tabId]) {
-    session.tabs[tabId] = createTabState(tab);
+  if (!globalTabStates[tabId]) {
+    globalTabStates[tabId] = createTabState(tab);
   }
-  return session.tabs[tabId];
+  return globalTabStates[tabId];
 }
 
 function destroyTabState(state) {
@@ -262,21 +262,17 @@ function destroyTabState(state) {
 }
 
 function removeTabStateFromAllClients(tabId) {
-  for (const client of clients) {
-    const session = ensureClientSession(client);
-    const state = session.tabs[tabId];
-    if (!state) continue;
+  const state = globalTabStates[tabId];
+  if (state) {
     destroyTabState(state);
-    delete session.tabs[tabId];
+    delete globalTabStates[tabId];
   }
 }
 
-function destroyClientSession(ws) {
-  const session = ensureClientSession(ws);
-  for (const state of Object.values(session.tabs)) {
+function destroyAllTabStates() {
+  for (const state of Object.values(globalTabStates)) {
     destroyTabState(state);
   }
-  session.tabs = Object.create(null);
 }
 
 function appendScrollback(state, data) {
@@ -309,7 +305,7 @@ function sendMessage(ws, msg) {
 
 function spawnTab(ws, tabId, cols, rows) {
   const tab = getTab(tabId);
-  const state = ensureTabState(ws, tabId);
+  const state = getGlobalTabState(tabId);
   if (!tab || !state || state.pty) return;
   const tabArgs = [...(state.args || tab.args || [])];
   const initialSize = normalizeTerminalSize(cols, rows, state.cols, state.rows);
@@ -351,14 +347,14 @@ function spawnTab(ws, tabId, cols, rows) {
 
     state.pty.onData((data) => {
       appendScrollback(state, data);
-      sendMessage(ws, { type: 'output', tab: tabId, data });
+      broadcast({ type: 'output', tab: tabId, data });
     });
 
     state.pty.onExit(() => {
       console.log(`[PTY] ${tab.label} exited`);
       state.pty = null;
       state.status = 'stopped';
-      sendMessage(ws, { type: 'exit', tab: tabId });
+      broadcast({ type: 'exit', tab: tabId });
     });
 
     console.log(`[PTY] Spawned ${tab.label}: ${tab.cmd} ${tabArgs.join(' ')}`);
@@ -522,6 +518,7 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
   border-bottom:1px solid rgba(233,69,96,0.45);
   pointer-events:none;
 }
+.xterm.cc-ime-composing .composition-view{display:none!important}
 
 /* Overlay */
 #overlay{
@@ -572,10 +569,11 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
   #scroll-bottom-btn{bottom:12px;width:44px;height:44px}
   .term-panel .xterm-screen,.term-panel .xterm-screen *{pointer-events:none}
   .xterm .xterm-helper-textarea.ios-inline-ime{
-    opacity:1!important;z-index:6!important;
-    color:#e0e0e0!important;-webkit-text-fill-color:#e0e0e0!important;caret-color:#e0e0e0!important;
+    opacity:0!important;z-index:6!important;
+    width:1px!important;height:1px!important;
+    color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:transparent!important;
     background:transparent!important;border:none!important;outline:none!important;
-    box-shadow:none!important;clip:auto!important;clip-path:none!important;
+    box-shadow:none!important;clip:rect(0,0,0,0)!important;clip-path:inset(50%)!important;
     white-space:pre!important;overflow:hidden!important;pointer-events:none!important;
   }
   .xterm .composition-view.ios-inline-ime-hidden{display:none!important}
@@ -592,7 +590,6 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
   }
   .mobile-row::-webkit-scrollbar{display:none}
   .mobile-row-secondary{justify-content:center;overflow:visible}
-  .mobile-row-secondary #btn-esc{order:0}
   .mobile-row-arrows{justify-content:center;overflow:visible}
   .mobile-row-ctrlc{justify-content:center;overflow:visible;position:relative}
   .arrow-pad{
@@ -629,9 +626,24 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
     background:rgba(96,165,250,0.12);color:#60a5fa;border-color:rgba(96,165,250,0.25);
   }
   .qk-upload:active{background:#60a5fa;color:#000;border-color:#60a5fa}
-  .qk-arrow{background:rgba(168,85,247,0.12);color:#a855f7;border-color:rgba(168,85,247,0.25);min-width:36px;padding:6px 8px}
-  .qk-arrow:active{background:#a855f7;color:#fff;border-color:#a855f7}
+  .qk-arrow{
+    min-width:36px;padding:6px 8px;
+    background:linear-gradient(180deg,#50555d 0%,#2f343b 100%);
+    color:#d8dde7;
+    border:1px solid #1d2127;
+    border-radius:6px;
+    box-shadow:0 1px 0 1px #0d1014,0 -1px 0 0 #656b74 inset,0 2px 4px rgba(0,0,0,0.34);
+    text-shadow:0 1px 1px rgba(0,0,0,0.38);
+  }
+  .qk-arrow:active{
+    background:linear-gradient(180deg,#2b3036 0%,#3a4048 100%);
+    color:#f5f7fb;
+    border-color:#181c21;
+    box-shadow:0 0 0 1px #0d1014,0 1px 2px rgba(0,0,0,0.28) inset;
+    transform:translateY(1px) scale(0.97);
+  }
   .qk-nav{min-width:86px}
+  .qk-space{min-width:102px;padding:4px 16px}
   .qk-backspace{
     min-width:46px;padding:4px 10px;font-family:inherit;
     background:linear-gradient(180deg,#4a4a4f 0%,#2c2c30 100%);
@@ -703,6 +715,39 @@ html[data-display-mode="standalone"] #scroll-bottom-btn{
 .toast.success{background:rgba(74,222,128,0.85)}
 .toast.error{background:rgba(239,68,68,0.85)}
 .toast.info{background:rgba(96,165,250,0.85)}
+
+/* Reader mode overlay */
+#reader-overlay{
+  display:none;position:fixed;inset:0;z-index:50;
+  background:#111833;
+  flex-direction:column;
+}
+#reader-overlay.show{display:flex}
+#reader-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:10px 16px;padding-top:calc(10px + env(safe-area-inset-top,0));
+  background:#0d1326;border-bottom:1px solid rgba(233,69,96,0.15);
+  flex-shrink:0;
+}
+#reader-header .reader-title{color:#e0e0e0;font-size:14px;font-weight:600}
+#reader-close-btn{
+  padding:6px 16px;border:none;border-radius:16px;
+  background:#e94560;color:#fff;font-size:13px;font-weight:600;
+  cursor:pointer;
+}
+#reader-close-btn:active{opacity:0.7}
+#reader-content{
+  flex:1;overflow:auto;-webkit-overflow-scrolling:touch;
+  padding:12px 14px;padding-bottom:calc(12px + env(safe-area-inset-bottom,0));
+}
+#reader-content pre{
+  margin:0;white-space:pre-wrap;word-break:break-all;
+  font-family:'Cascadia Code','Fira Code','JetBrains Mono','Menlo','Consolas',monospace;
+  font-size:12px;line-height:1.5;color:#d4d4d8;
+  -webkit-user-select:text;user-select:text;
+}
+.qk-reader{background:rgba(168,85,247,0.12);color:#c084fc;border-color:rgba(168,85,247,0.25)}
+.qk-reader:active{background:#c084fc;color:#000;border-color:#c084fc}
 </style></head>
 <body>
 <div id="app">
@@ -738,10 +783,11 @@ html[data-display-mode="standalone"] #scroll-bottom-btn{
       </button>
     </div>
     <div class="mobile-row mobile-row-secondary">
-      <button class="qk qk-nav" id="btn-esc">Esc</button>
+      <button class="qk qk-space" id="btn-space">Space</button>
       <button class="qk" id="btn-newline">换行</button>
       <button class="qk" id="btn-del">Del</button>
       <button class="qk qk-nav" id="btn-shift-tab">Shift+Tab</button>
+      <button class="qk qk-reader" id="btn-reader">阅读</button>
     </div>
     <div class="mobile-row mobile-row-arrows">
       <div class="arrow-pad">
@@ -752,8 +798,16 @@ html[data-display-mode="standalone"] #scroll-bottom-btn{
       </div>
     </div>
     <div class="mobile-row mobile-row-ctrlc">
+      <button class="qk qk-nav" id="btn-esc">Esc</button>
       <button class="qk qk-stop" id="btn-ctrlc">Ctrl+C</button>
     </div>
+  </div>
+  <div id="reader-overlay">
+    <div id="reader-header">
+      <span class="reader-title">阅读模式</span>
+      <button id="reader-close-btn" type="button">关闭</button>
+    </div>
+    <div id="reader-content"><pre id="reader-text"></pre></div>
   </div>
   <div id="status-indicator">
     <span id="status-text" class="status-text">Connecting</span>
@@ -786,13 +840,14 @@ var isIOS = /iPad|iPhone|iPod/i.test(navigator.userAgent)
 var headerEl = document.getElementById('header');
 var rightEl = document.createElement('div');
 rightEl.className = 'header-right';
-rightEl.innerHTML = '<div class="tab-actions"><button class="tab-action-btn plus" id="add-tab-btn" type="button" title="复制当前标签页" aria-label="复制当前标签页">+</button><button class="tab-action-btn caret" id="add-tab-menu-btn" type="button" title="从模板新建标签页" aria-label="从模板新建标签页">▾</button><div class="tab-template-menu" id="tab-template-menu"></div></div>';
+rightEl.innerHTML = '<button class="tab-action-btn" id="refresh-page-btn" type="button" title="刷新页面" aria-label="刷新页面"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button><div class="tab-actions"><button class="tab-action-btn plus" id="add-tab-btn" type="button" title="复制当前标签页" aria-label="复制当前标签页">+</button><button class="tab-action-btn caret" id="add-tab-menu-btn" type="button" title="从模板新建标签页" aria-label="从模板新建标签页">▾</button><div class="tab-template-menu" id="tab-template-menu"></div></div>';
 headerEl.appendChild(rightEl);
 // ===== Build xterm instances =====
 var appEl = document.getElementById('app');
 var wrapEl = document.getElementById('terminal-wrap');
 var mobileBarEl = document.getElementById('mobile-bar');
 var scrollBottomBtnEl = document.getElementById('scroll-bottom-btn');
+var refreshPageBtnEl = document.getElementById('refresh-page-btn');
 var addTabBtnEl = document.getElementById('add-tab-btn');
 var addTabMenuBtnEl = document.getElementById('add-tab-menu-btn');
 var tabTemplateMenuEl = document.getElementById('tab-template-menu');
@@ -1005,6 +1060,10 @@ function renderTabTemplateMenu() {
 
 renderTabTemplateMenu();
 
+bindPress(refreshPageBtnEl, function() {
+  location.reload();
+});
+
 bindPress(addTabBtnEl, function() {
   var source = findTab(activeTab) || TABS[0] || TAB_TEMPLATES[0];
   if (!source) return;
@@ -1058,6 +1117,25 @@ function getTermCompositionView(term) {
   return term.element.querySelector('.composition-view');
 }
 
+function getTermImeState(term) {
+  if (!term) return { composing: false };
+  if (!term.__ccImeState) {
+    term.__ccImeState = { composing: false };
+  }
+  return term.__ccImeState;
+}
+
+function setTermImeComposing(term, composing) {
+  if (!term) return;
+  var state = getTermImeState(term);
+  state.composing = !!composing;
+  if (term.element) term.element.classList.toggle('cc-ime-composing', state.composing);
+}
+
+function isTermImeComposing(term) {
+  return !!(term && term.__ccImeState && term.__ccImeState.composing);
+}
+
 function refreshTabViewport(tabId) {
   var term = terms[tabId];
   var panel = panels[tabId];
@@ -1077,9 +1155,21 @@ function scheduleTabViewportRefresh(tabId) {
 function updateMobileCompositionMetrics() {
 }
 
+function pinTextareaOffscreen(textarea) {
+  if (!textarea) return;
+  textarea.classList.remove('ios-inline-ime');
+  textarea.style.left = '-9999em';
+  textarea.style.top = '0';
+  textarea.style.width = '0';
+  textarea.style.height = '0';
+  textarea.style.opacity = '0';
+  textarea.style.clip = 'rect(0, 0, 0, 0)';
+  textarea.style.clipPath = 'inset(50%)';
+}
+
 function setIOSInlineImeState(textarea, composing) {
   if (!isIOS || !textarea) return;
-  textarea.classList.toggle('ios-inline-ime', composing);
+  pinTextareaOffscreen(textarea);
   var term = textarea.__ccTerm || null;
   var compositionView = term ? getTermCompositionView(term) : null;
   if (compositionView) compositionView.classList.toggle('ios-inline-ime-hidden', composing);
@@ -1090,7 +1180,7 @@ function setMobileComposingState(textarea, composing) {
 }
 
 function syncMobileCompositionTextarea(textarea) {
-  if (!isIOS || !textarea || !textarea.classList.contains('ios-inline-ime')) return;
+  if (!isIOS || !textarea) return;
   setIOSInlineImeState(textarea, true);
 }
 
@@ -1116,18 +1206,42 @@ function recordMobileBridgeDispatch(term, data) {
 }
 
 function consumeMobileBridgeEcho(term, data) {
-  if (!term || !data || !term.__ccMobileBridgeState) return false;
+  if (!term || !data || !term.__ccMobileBridgeState) return null;
   var bridgeState = term.__ccMobileBridgeState;
   var now = Date.now();
   bridgeState.pendingEchoes = bridgeState.pendingEchoes.filter(function(item) {
     return item.expiresAt > now;
   });
-  var index = bridgeState.pendingEchoes.findIndex(function(item) {
-    return item.data === data;
-  });
-  if (index === -1) return false;
-  bridgeState.pendingEchoes.splice(index, 1);
-  return true;
+  var remaining = data;
+  var consumed = false;
+
+  while (remaining && bridgeState.pendingEchoes.length) {
+    var item = bridgeState.pendingEchoes[0];
+    if (!item || !item.data) {
+      bridgeState.pendingEchoes.shift();
+      continue;
+    }
+
+    if (item.data.indexOf(remaining) === 0) {
+      item.data = item.data.slice(remaining.length);
+      if (!item.data) bridgeState.pendingEchoes.shift();
+      consumed = true;
+      remaining = '';
+      break;
+    }
+
+    if (remaining.indexOf(item.data) === 0) {
+      remaining = remaining.slice(item.data.length);
+      bridgeState.pendingEchoes.shift();
+      consumed = true;
+      continue;
+    }
+
+    break;
+  }
+
+  if (!consumed) return null;
+  return remaining;
 }
 
 function installMobileTextareaBridge(term, tabId) {
@@ -1139,8 +1253,37 @@ function installMobileTextareaBridge(term, tabId) {
   var bridgeState = {
     composing: false,
     lastDispatchedText: '',
-    lastDispatchAt: 0
+    lastDispatchAt: 0,
+    compositionCommitted: false,
+    pendingCompositionText: '',
+    pendingCompositionTimer: 0
   };
+
+  function clearPendingCompositionFallback() {
+    if (bridgeState.pendingCompositionTimer) {
+      clearTimeout(bridgeState.pendingCompositionTimer);
+      bridgeState.pendingCompositionTimer = 0;
+    }
+    bridgeState.pendingCompositionText = '';
+  }
+
+  function markCompositionCommitted() {
+    bridgeState.compositionCommitted = true;
+    clearPendingCompositionFallback();
+  }
+
+  function scheduleCompositionFallback(text) {
+    clearPendingCompositionFallback();
+    if (!text || bridgeState.compositionCommitted) return;
+    bridgeState.pendingCompositionText = text;
+    bridgeState.pendingCompositionTimer = setTimeout(function() {
+      bridgeState.pendingCompositionTimer = 0;
+      var fallbackText = bridgeState.pendingCompositionText;
+      bridgeState.pendingCompositionText = '';
+      if (bridgeState.compositionCommitted || !fallbackText) return;
+      dispatchTextareaText(fallbackText);
+    }, 30);
+  }
 
   function clearTextareaValue() {
     textarea.value = '';
@@ -1176,6 +1319,7 @@ function installMobileTextareaBridge(term, tabId) {
   }
 
   function dispatchControlInput(data) {
+    markCompositionCommitted();
     recordMobileBridgeDispatch(term, data);
     sendRaw(tabId, data);
     clearTextareaValue();
@@ -1184,12 +1328,15 @@ function installMobileTextareaBridge(term, tabId) {
 
   textarea.addEventListener('compositionstart', function() {
     bridgeState.composing = true;
+    bridgeState.compositionCommitted = false;
+    clearPendingCompositionFallback();
   }, true);
 
   textarea.addEventListener('compositionend', function(e) {
     bridgeState.composing = false;
     if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
-    dispatchTextareaText((e && e.data) || textarea.value || '');
+    var text = (e && e.data) || textarea.value || '';
+    scheduleCompositionFallback(text);
     requestAnimationFrame(function() {
       setMobileComposingState(textarea, false);
     });
@@ -1221,7 +1368,7 @@ function installMobileTextareaBridge(term, tabId) {
     if (e.inputType === 'insertText'
       || e.inputType === 'insertReplacementText'
       || e.inputType === 'insertFromComposition') {
-      if (bridgeState.composing && e.inputType !== 'insertFromComposition') {
+      if ((e.isComposing || bridgeState.composing) && e.inputType !== 'insertFromComposition') {
         syncMobileCompositionTextarea(textarea);
         return;
       }
@@ -1229,6 +1376,7 @@ function installMobileTextareaBridge(term, tabId) {
       if (!text) return;
       e.preventDefault();
       if (typeof e.stopPropagation === 'function') e.stopPropagation();
+      markCompositionCommitted();
       dispatchTextareaText(text);
     }
   }, true);
@@ -1237,6 +1385,7 @@ function installMobileTextareaBridge(term, tabId) {
 function suppressNativeCaret(term) {
   var textarea = getTermTextarea(term);
   if (!textarea) return;
+  pinTextareaOffscreen(textarea);
   textarea.setAttribute('autocapitalize', 'off');
   textarea.setAttribute('autocomplete', 'off');
   textarea.setAttribute('autocorrect', 'off');
@@ -1257,6 +1406,7 @@ function blurTerm(term) {
 function focusTermTextarea(term) {
   var textarea = getTermTextarea(term);
   if (!textarea) return;
+  pinTextareaOffscreen(textarea);
   textarea.readOnly = false;
   textarea.disabled = false;
   textarea.setAttribute('inputmode', 'text');
@@ -1401,31 +1551,44 @@ function mountTab(tab) {
   if (window.WebLinksAddon) term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
   term.open(panel);
   suppressNativeCaret(term);
-  var useMobileTextareaBridge = shouldUseMobileTextareaBridge(t);
-  if (isMobile) {
-    var ta = getTermTextarea(term);
-    if (ta) {
-      term.__ccTextarea = ta;
-      ta.__ccTerm = term;
-      ta.addEventListener('compositionstart', function() {
+  var ta = getTermTextarea(term);
+  if (ta) {
+    term.__ccTextarea = ta;
+    ta.__ccTerm = term;
+    ta.addEventListener('compositionstart', function() {
+      if (isMobile && useMobileTextareaBridge) {
         setMobileComposingState(ta, true);
         scrollActiveTabToBottom();
-      }, true);
-      ta.addEventListener('compositionupdate', function() {
-        syncMobileCompositionTextarea(ta);
-      }, true);
-      ta.addEventListener('input', function() {
-        syncMobileCompositionTextarea(ta);
-      }, true);
-      ta.addEventListener('compositionend', function() {
-        if (!useMobileTextareaBridge) requestAnimationFrame(function() {
-          setMobileComposingState(ta, false);
-        });
-      }, true);
-      ta.addEventListener('blur', function() {
+      }
+    }, true);
+    ta.addEventListener('compositionupdate', function() {
+      if (isMobile && useMobileTextareaBridge) syncMobileCompositionTextarea(ta);
+    }, true);
+    ta.addEventListener('input', function() {
+      if (isMobile && useMobileTextareaBridge) syncMobileCompositionTextarea(ta);
+    }, true);
+    ta.addEventListener('compositionend', function(e) {
+      if (!isMobile) {
+        // Desktop: use e.data (actual committed text) instead of ta.value (may be stale
+        // from candidate browsing). Clear textarea BEFORE xterm reads it to prevent
+        // xterm from double-sending or committing a cancelled/stale composition.
+        var composedText = (e && e.data) || '';
+        ta.value = '';
+        try { ta.setSelectionRange(0, 0); } catch (rnErr) {}
+        if (composedText) sendRaw(t.id, composedText);
+        return;
+      }
+      if (!useMobileTextareaBridge) return;
+      requestAnimationFrame(function() {
         setMobileComposingState(ta, false);
-      }, true);
-    }
+      });
+    }, true);
+    ta.addEventListener('blur', function() {
+      if (isMobile && useMobileTextareaBridge) setMobileComposingState(ta, false);
+    }, true);
+  }
+  var useMobileTextareaBridge = shouldUseMobileTextareaBridge(t);
+  if (isMobile) {
     if (useMobileTextareaBridge) {
       installMobileTextareaBridge(term, t.id);
     }
@@ -1450,13 +1613,50 @@ function mountTab(tab) {
         sendRaw(tabId, '\\n');
         return false;
       }
+      // Ctrl+C: copy if selection exists, otherwise send interrupt
+      if (e.ctrlKey && e.key === 'c') {
+        if (t.hasSelection()) {
+          navigator.clipboard.writeText(t.getSelection()).catch(function(){});
+          t.clearSelection();
+          return false; // prevent sending to terminal
+        }
+        // no selection — let xterm send ^C to terminal
+        return true;
+      }
+      // Ctrl+V: paste from clipboard
+      if (e.ctrlKey && e.key === 'v') {
+        e.preventDefault();
+        if (navigator.clipboard && navigator.clipboard.readText) {
+          navigator.clipboard.readText().then(function(text) {
+            if (text) sendRaw(tabId, text);
+          }).catch(function(){});
+        }
+        return false;
+      }
       return true;
+    });
+
+    // Right-click to paste
+    t.element.addEventListener('contextmenu', function(e) {
+      e.preventDefault();
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText().then(function(text) {
+          if (text) sendRaw(tabId, text);
+        }).catch(function(){});
+      }
+    });
+
+    // Select-to-copy (Linux-style): auto copy on selection
+    t.onSelectionChange(function() {
+      var text = t.getSelection();
+      if (text) {
+        navigator.clipboard.writeText(text).catch(function(){});
+      }
     });
   })(t.id, term);
 
   // Keyboard input (both desktop and mobile)
   term.onData(function(data) {
-    if (shouldUseMobileTextareaBridge(t) && consumeMobileBridgeEcho(term, data)) return;
     sendRaw(t.id, data);
   });
   return t;
@@ -1800,6 +2000,12 @@ if (isMobile) {
     sendMobileShortcut('\x1b');
   }, { passive: false });
 
+  // --- Space button ---
+  document.getElementById('btn-space').addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    sendMobileShortcut(' ');
+  }, { passive: false });
+
   // --- Shift+Tab button ---
   document.getElementById('btn-shift-tab').addEventListener('touchstart', function(e) {
     e.preventDefault();
@@ -1810,6 +2016,42 @@ if (isMobile) {
   document.getElementById('btn-del').addEventListener('touchstart', function(e) {
     e.preventDefault();
     sendMobileShortcut('\x1b[3~');
+  }, { passive: false });
+
+  // --- Reader mode: show terminal content as selectable text ---
+  var readerOverlay = document.getElementById('reader-overlay');
+  var readerText = document.getElementById('reader-text');
+  var readerContent = document.getElementById('reader-content');
+
+  function openReaderMode() {
+    var term = terms[activeTab];
+    if (!term) return;
+    var buf = term.buffer.active;
+    var lines = [];
+    for (var i = 0; i <= buf.length - 1; i++) {
+      var line = buf.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+    // trim trailing empty lines
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    readerText.textContent = lines.join('\\n');
+    readerOverlay.classList.add('show');
+    // scroll to bottom
+    readerContent.scrollTop = readerContent.scrollHeight;
+  }
+
+  function closeReaderMode() {
+    readerOverlay.classList.remove('show');
+    requestActiveTermFocus();
+  }
+
+  document.getElementById('btn-reader').addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    openReaderMode();
+  }, { passive: false });
+  document.getElementById('reader-close-btn').addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    closeReaderMode();
   }, { passive: false });
 
   // --- Paste button: read clipboard and send to terminal ---
@@ -2011,7 +2253,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/manifest.json') {
-    res.writeHead(200, { 'Content-Type': 'application/manifest+json' });
+    res.writeHead(200, { 'Content-Type': 'application/manifest+json', ...NO_CACHE_HEADERS });
     res.end(JSON.stringify({
       name: 'CC Terminal',
       short_name: 'CC',
@@ -2025,7 +2267,7 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/' || url.pathname === '/login') {
     if (isAuthed(req)) { res.writeHead(302, { Location: '/terminal' }); res.end(); return; }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...NO_CACHE_HEADERS });
     res.end(LOGIN_HTML);
     return;
   }
@@ -2039,15 +2281,16 @@ const server = http.createServer((req, res) => {
         if (token === TOKEN) {
           res.writeHead(200, {
             'Set-Cookie': `cct=${TOKEN}; HttpOnly; SameSite=Strict; Path=/`,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            ...NO_CACHE_HEADERS,
           });
           res.end('{"ok":true}');
         } else {
-          res.writeHead(401);
+          res.writeHead(401, NO_CACHE_HEADERS);
           res.end('{"ok":false}');
         }
       } catch {
-        res.writeHead(400);
+        res.writeHead(400, NO_CACHE_HEADERS);
         res.end('bad request');
       }
     });
@@ -2056,7 +2299,7 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/terminal') {
     if (!isAuthed(req)) { res.writeHead(302, { Location: '/' }); res.end(); return; }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...NO_CACHE_HEADERS });
     res.end(TERMINAL_HTML);
     return;
   }
@@ -2134,7 +2377,6 @@ wss.on('connection', (ws, req) => {
   }
 
   clients.add(ws);
-  ensureClientSession(ws);
 
   ws.on('message', (raw) => {
     try {
@@ -2144,11 +2386,16 @@ wss.on('connection', (ws, req) => {
         const tabId = msg.tab;
         const tab = getTab(tabId);
         if (!tab) return;
-        const state = ensureTabState(ws, tabId);
+        const state = getGlobalTabState(tabId);
         if (!state.pty && state.status !== 'error') {
           spawnTab(ws, tabId, msg.cols, msg.rows);
-        } else if (state.pty && msg.cols && msg.rows) {
-          resizeTab(state, msg.cols, msg.rows);
+        } else {
+          if (state.scrollback) {
+            sendMessage(ws, { type: 'scrollback', tab: tabId, data: state.scrollback });
+          }
+          if (state.pty && msg.cols && msg.rows) {
+            resizeTab(state, msg.cols, msg.rows);
+          }
         }
         sendMessage(ws, { type: 'status', tab: tabId, status: state.status });
       }
@@ -2210,21 +2457,20 @@ wss.on('connection', (ws, req) => {
 
       if (msg.type === 'input') {
         if (!getTab(msg.tab)) return;
-        const state = ensureTabState(ws, msg.tab);
+        const state = getGlobalTabState(msg.tab);
         if (state && state.pty) state.pty.write(msg.data);
       }
 
       if (msg.type === 'resize') {
         const tabId = msg.tab;
         if (!getTab(tabId)) return;
-        const state = ensureTabState(ws, tabId);
+        const state = getGlobalTabState(tabId);
         resizeTab(state, msg.cols || 80, msg.rows || 24);
       }
     } catch {}
   });
 
   function handleClientDetach() {
-    destroyClientSession(ws);
     clients.delete(ws);
   }
 
@@ -2240,8 +2486,6 @@ server.listen(PORT, '127.0.0.1', () => {
 });
 
 process.on('SIGINT', () => {
-  for (const client of clients) {
-    destroyClientSession(client);
-  }
+  destroyAllTabStates();
   process.exit(0);
 });
