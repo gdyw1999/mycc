@@ -131,3 +131,35 @@ update-cmd-gitbash.ps1
 ieee.png
 ieee_results.html
 package-lock.json
+
+# ====================================
+# 搏哥的本地文档（不上传）
+# ====================================
+.pace/
+docs/AI相关产品-CHANGELOG.md
+docs/AI相关产品-README.md
+docs/OpenClaw背景.md
+docs/openclaw-README.md
+docs/物业巡检.md
+docs/物业AI巡检-README.md
+
+# ====================================
+# 配置文件（敏感信息不上传）
+# ====================================
+# API Keys / Tokens / Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+token*.json
+*api*key*
+*secret*
+
+# Claude Code / Skills 本地配置
+.claude/settings.local.json
+.claude/skills/*/config.json
+.claude/skills/*/local-config.json
+.claude/skills/*/.env
+.claude/skills/*/credentials.json
