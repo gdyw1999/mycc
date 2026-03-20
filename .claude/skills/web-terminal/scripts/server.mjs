@@ -17,6 +17,11 @@ const CWD = process.env.WEB_TERMINAL_CWD || process.cwd();
 const MAX_SCROLLBACK = 50 * 1024;
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024; // 50MB
 const RUNTIME_TABS_PATH = path.resolve(CWD, '.claude', 'skills', 'web-terminal', 'runtime-tabs.json');
+const NO_CACHE_HEADERS = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate',
+  Pragma: 'no-cache',
+  Expires: '0',
+};
 
 // Tab definitions
 const configuredTabs = [
@@ -238,21 +243,16 @@ function registerRuntimeTabFromSource(source, options = {}) {
   return { tab };
 }
 
-function ensureClientSession(ws) {
-  if (!ws.__ccTerminalSession) {
-    ws.__ccTerminalSession = { tabs: Object.create(null) };
-  }
-  return ws.__ccTerminalSession;
-}
+// Global PTY sessions — persist across WebSocket reconnects
+const globalTabStates = Object.create(null);
 
-function ensureTabState(ws, tabId) {
+function getGlobalTabState(tabId) {
   const tab = getTab(tabId);
   if (!tab) return null;
-  const session = ensureClientSession(ws);
-  if (!session.tabs[tabId]) {
-    session.tabs[tabId] = createTabState(tab);
+  if (!globalTabStates[tabId]) {
+    globalTabStates[tabId] = createTabState(tab);
   }
-  return session.tabs[tabId];
+  return globalTabStates[tabId];
 }
 
 function destroyTabState(state) {
@@ -262,21 +262,17 @@ function destroyTabState(state) {
 }
 
 function removeTabStateFromAllClients(tabId) {
-  for (const client of clients) {
-    const session = ensureClientSession(client);
-    const state = session.tabs[tabId];
-    if (!state) continue;
+  const state = globalTabStates[tabId];
+  if (state) {
     destroyTabState(state);
-    delete session.tabs[tabId];
+    delete globalTabStates[tabId];
   }
 }
 
-function destroyClientSession(ws) {
-  const session = ensureClientSession(ws);
-  for (const state of Object.values(session.tabs)) {
+function destroyAllTabStates() {
+  for (const state of Object.values(globalTabStates)) {
     destroyTabState(state);
   }
-  session.tabs = Object.create(null);
 }
 
 function appendScrollback(state, data) {
@@ -309,7 +305,7 @@ function sendMessage(ws, msg) {
 
 function spawnTab(ws, tabId, cols, rows) {
   const tab = getTab(tabId);
-  const state = ensureTabState(ws, tabId);
+  const state = getGlobalTabState(tabId);
   if (!tab || !state || state.pty) return;
   const tabArgs = [...(state.args || tab.args || [])];
   const initialSize = normalizeTerminalSize(cols, rows, state.cols, state.rows);
@@ -351,14 +347,14 @@ function spawnTab(ws, tabId, cols, rows) {
 
     state.pty.onData((data) => {
       appendScrollback(state, data);
-      sendMessage(ws, { type: 'output', tab: tabId, data });
+      broadcast({ type: 'output', tab: tabId, data });
     });
 
     state.pty.onExit(() => {
       console.log(`[PTY] ${tab.label} exited`);
       state.pty = null;
       state.status = 'stopped';
-      sendMessage(ws, { type: 'exit', tab: tabId });
+      broadcast({ type: 'exit', tab: tabId });
     });
 
     console.log(`[PTY] Spawned ${tab.label}: ${tab.cmd} ${tabArgs.join(' ')}`);
@@ -522,6 +518,7 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
   border-bottom:1px solid rgba(233,69,96,0.45);
   pointer-events:none;
 }
+.xterm.cc-ime-composing .composition-view{display:none!important}
 
 /* Overlay */
 #overlay{
@@ -572,10 +569,11 @@ html,body{height:100%;background:#1a1a2e;overflow:hidden;font-family:-apple-syst
   #scroll-bottom-btn{bottom:12px;width:44px;height:44px}
   .term-panel .xterm-screen,.term-panel .xterm-screen *{pointer-events:none}
   .xterm .xterm-helper-textarea.ios-inline-ime{
-    opacity:1!important;z-index:6!important;
-    color:#e0e0e0!important;-webkit-text-fill-color:#e0e0e0!important;caret-color:#e0e0e0!important;
+    opacity:0!important;z-index:6!important;
+    width:1px!important;height:1px!important;
+    color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:transparent!important;
     background:transparent!important;border:none!important;outline:none!important;
-    box-shadow:none!important;clip:auto!important;clip-path:none!important;
+    box-shadow:none!important;clip:rect(0,0,0,0)!important;clip-path:inset(50%)!important;
     white-space:pre!important;overflow:hidden!important;pointer-events:none!important;
   }
   .xterm .composition-view.ios-inline-ime-hidden{display:none!important}
@@ -1058,6 +1056,25 @@ function getTermCompositionView(term) {
   return term.element.querySelector('.composition-view');
 }
 
+function getTermImeState(term) {
+  if (!term) return { composing: false };
+  if (!term.__ccImeState) {
+    term.__ccImeState = { composing: false };
+  }
+  return term.__ccImeState;
+}
+
+function setTermImeComposing(term, composing) {
+  if (!term) return;
+  var state = getTermImeState(term);
+  state.composing = !!composing;
+  if (term.element) term.element.classList.toggle('cc-ime-composing', state.composing);
+}
+
+function isTermImeComposing(term) {
+  return !!(term && term.__ccImeState && term.__ccImeState.composing);
+}
+
 function refreshTabViewport(tabId) {
   var term = terms[tabId];
   var panel = panels[tabId];
@@ -1077,9 +1094,21 @@ function scheduleTabViewportRefresh(tabId) {
 function updateMobileCompositionMetrics() {
 }
 
+function pinTextareaOffscreen(textarea) {
+  if (!textarea) return;
+  textarea.classList.remove('ios-inline-ime');
+  textarea.style.left = '-9999em';
+  textarea.style.top = '0';
+  textarea.style.width = '0';
+  textarea.style.height = '0';
+  textarea.style.opacity = '0';
+  textarea.style.clip = 'rect(0, 0, 0, 0)';
+  textarea.style.clipPath = 'inset(50%)';
+}
+
 function setIOSInlineImeState(textarea, composing) {
   if (!isIOS || !textarea) return;
-  textarea.classList.toggle('ios-inline-ime', composing);
+  pinTextareaOffscreen(textarea);
   var term = textarea.__ccTerm || null;
   var compositionView = term ? getTermCompositionView(term) : null;
   if (compositionView) compositionView.classList.toggle('ios-inline-ime-hidden', composing);
@@ -1090,7 +1119,7 @@ function setMobileComposingState(textarea, composing) {
 }
 
 function syncMobileCompositionTextarea(textarea) {
-  if (!isIOS || !textarea || !textarea.classList.contains('ios-inline-ime')) return;
+  if (!isIOS || !textarea) return;
   setIOSInlineImeState(textarea, true);
 }
 
@@ -1116,18 +1145,42 @@ function recordMobileBridgeDispatch(term, data) {
 }
 
 function consumeMobileBridgeEcho(term, data) {
-  if (!term || !data || !term.__ccMobileBridgeState) return false;
+  if (!term || !data || !term.__ccMobileBridgeState) return null;
   var bridgeState = term.__ccMobileBridgeState;
   var now = Date.now();
   bridgeState.pendingEchoes = bridgeState.pendingEchoes.filter(function(item) {
     return item.expiresAt > now;
   });
-  var index = bridgeState.pendingEchoes.findIndex(function(item) {
-    return item.data === data;
-  });
-  if (index === -1) return false;
-  bridgeState.pendingEchoes.splice(index, 1);
-  return true;
+  var remaining = data;
+  var consumed = false;
+
+  while (remaining && bridgeState.pendingEchoes.length) {
+    var item = bridgeState.pendingEchoes[0];
+    if (!item || !item.data) {
+      bridgeState.pendingEchoes.shift();
+      continue;
+    }
+
+    if (item.data.indexOf(remaining) === 0) {
+      item.data = item.data.slice(remaining.length);
+      if (!item.data) bridgeState.pendingEchoes.shift();
+      consumed = true;
+      remaining = '';
+      break;
+    }
+
+    if (remaining.indexOf(item.data) === 0) {
+      remaining = remaining.slice(item.data.length);
+      bridgeState.pendingEchoes.shift();
+      consumed = true;
+      continue;
+    }
+
+    break;
+  }
+
+  if (!consumed) return null;
+  return remaining;
 }
 
 function installMobileTextareaBridge(term, tabId) {
@@ -1237,6 +1290,7 @@ function installMobileTextareaBridge(term, tabId) {
 function suppressNativeCaret(term) {
   var textarea = getTermTextarea(term);
   if (!textarea) return;
+  pinTextareaOffscreen(textarea);
   textarea.setAttribute('autocapitalize', 'off');
   textarea.setAttribute('autocomplete', 'off');
   textarea.setAttribute('autocorrect', 'off');
@@ -1257,6 +1311,7 @@ function blurTerm(term) {
 function focusTermTextarea(term) {
   var textarea = getTermTextarea(term);
   if (!textarea) return;
+  pinTextareaOffscreen(textarea);
   textarea.readOnly = false;
   textarea.disabled = false;
   textarea.setAttribute('inputmode', 'text');
@@ -1401,31 +1456,38 @@ function mountTab(tab) {
   if (window.WebLinksAddon) term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
   term.open(panel);
   suppressNativeCaret(term);
-  var useMobileTextareaBridge = shouldUseMobileTextareaBridge(t);
-  if (isMobile) {
-    var ta = getTermTextarea(term);
-    if (ta) {
-      term.__ccTextarea = ta;
-      ta.__ccTerm = term;
-      ta.addEventListener('compositionstart', function() {
+  var ta = getTermTextarea(term);
+  if (ta) {
+    term.__ccTextarea = ta;
+    ta.__ccTerm = term;
+    ta.addEventListener('compositionstart', function() {
+      setTermImeComposing(term, true);
+      if (isMobile) {
         setMobileComposingState(ta, true);
         scrollActiveTabToBottom();
-      }, true);
-      ta.addEventListener('compositionupdate', function() {
-        syncMobileCompositionTextarea(ta);
-      }, true);
-      ta.addEventListener('input', function() {
-        syncMobileCompositionTextarea(ta);
-      }, true);
-      ta.addEventListener('compositionend', function() {
-        if (!useMobileTextareaBridge) requestAnimationFrame(function() {
+      }
+    }, true);
+    ta.addEventListener('compositionupdate', function() {
+      if (isMobile) syncMobileCompositionTextarea(ta);
+    }, true);
+    ta.addEventListener('input', function() {
+      if (isMobile) syncMobileCompositionTextarea(ta);
+    }, true);
+    ta.addEventListener('compositionend', function() {
+      setTermImeComposing(term, false);
+      if (isMobile && !useMobileTextareaBridge) {
+        requestAnimationFrame(function() {
           setMobileComposingState(ta, false);
         });
-      }, true);
-      ta.addEventListener('blur', function() {
-        setMobileComposingState(ta, false);
-      }, true);
-    }
+      }
+    }, true);
+    ta.addEventListener('blur', function() {
+      setTermImeComposing(term, false);
+      if (isMobile) setMobileComposingState(ta, false);
+    }, true);
+  }
+  var useMobileTextareaBridge = shouldUseMobileTextareaBridge(t);
+  if (isMobile) {
     if (useMobileTextareaBridge) {
       installMobileTextareaBridge(term, t.id);
     }
@@ -1445,6 +1507,7 @@ function mountTab(tab) {
   (function(tabId, t) {
     t.attachCustomKeyEventHandler(function(e) {
       if (e.type !== 'keydown') return true;
+      if (e.isComposing || isTermImeComposing(t)) return true;
       if (e.key === 'Enter' && e.shiftKey) {
         e.preventDefault();
         sendRaw(tabId, '\\n');
@@ -1456,7 +1519,15 @@ function mountTab(tab) {
 
   // Keyboard input (both desktop and mobile)
   term.onData(function(data) {
-    if (shouldUseMobileTextareaBridge(t) && consumeMobileBridgeEcho(term, data)) return;
+    if (isTermImeComposing(term)) return;
+    if (shouldUseMobileTextareaBridge(t)) {
+      var remaining = consumeMobileBridgeEcho(term, data);
+      if (remaining === '') return;
+      if (remaining !== null) {
+        if (remaining) sendRaw(t.id, remaining);
+        return;
+      }
+    }
     sendRaw(t.id, data);
   });
   return t;
@@ -2011,7 +2082,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/manifest.json') {
-    res.writeHead(200, { 'Content-Type': 'application/manifest+json' });
+    res.writeHead(200, { 'Content-Type': 'application/manifest+json', ...NO_CACHE_HEADERS });
     res.end(JSON.stringify({
       name: 'CC Terminal',
       short_name: 'CC',
@@ -2025,7 +2096,7 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/' || url.pathname === '/login') {
     if (isAuthed(req)) { res.writeHead(302, { Location: '/terminal' }); res.end(); return; }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...NO_CACHE_HEADERS });
     res.end(LOGIN_HTML);
     return;
   }
@@ -2039,15 +2110,16 @@ const server = http.createServer((req, res) => {
         if (token === TOKEN) {
           res.writeHead(200, {
             'Set-Cookie': `cct=${TOKEN}; HttpOnly; SameSite=Strict; Path=/`,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            ...NO_CACHE_HEADERS,
           });
           res.end('{"ok":true}');
         } else {
-          res.writeHead(401);
+          res.writeHead(401, NO_CACHE_HEADERS);
           res.end('{"ok":false}');
         }
       } catch {
-        res.writeHead(400);
+        res.writeHead(400, NO_CACHE_HEADERS);
         res.end('bad request');
       }
     });
@@ -2056,7 +2128,7 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/terminal') {
     if (!isAuthed(req)) { res.writeHead(302, { Location: '/' }); res.end(); return; }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...NO_CACHE_HEADERS });
     res.end(TERMINAL_HTML);
     return;
   }
@@ -2134,7 +2206,6 @@ wss.on('connection', (ws, req) => {
   }
 
   clients.add(ws);
-  ensureClientSession(ws);
 
   ws.on('message', (raw) => {
     try {
@@ -2144,11 +2215,16 @@ wss.on('connection', (ws, req) => {
         const tabId = msg.tab;
         const tab = getTab(tabId);
         if (!tab) return;
-        const state = ensureTabState(ws, tabId);
+        const state = getGlobalTabState(tabId);
         if (!state.pty && state.status !== 'error') {
           spawnTab(ws, tabId, msg.cols, msg.rows);
-        } else if (state.pty && msg.cols && msg.rows) {
-          resizeTab(state, msg.cols, msg.rows);
+        } else {
+          if (state.scrollback) {
+            sendMessage(ws, { type: 'scrollback', tab: tabId, data: state.scrollback });
+          }
+          if (state.pty && msg.cols && msg.rows) {
+            resizeTab(state, msg.cols, msg.rows);
+          }
         }
         sendMessage(ws, { type: 'status', tab: tabId, status: state.status });
       }
@@ -2210,21 +2286,20 @@ wss.on('connection', (ws, req) => {
 
       if (msg.type === 'input') {
         if (!getTab(msg.tab)) return;
-        const state = ensureTabState(ws, msg.tab);
+        const state = getGlobalTabState(msg.tab);
         if (state && state.pty) state.pty.write(msg.data);
       }
 
       if (msg.type === 'resize') {
         const tabId = msg.tab;
         if (!getTab(tabId)) return;
-        const state = ensureTabState(ws, tabId);
+        const state = getGlobalTabState(tabId);
         resizeTab(state, msg.cols || 80, msg.rows || 24);
       }
     } catch {}
   });
 
   function handleClientDetach() {
-    destroyClientSession(ws);
     clients.delete(ws);
   }
 
@@ -2240,8 +2315,6 @@ server.listen(PORT, '127.0.0.1', () => {
 });
 
 process.on('SIGINT', () => {
-  for (const client of clients) {
-    destroyClientSession(client);
-  }
+  destroyAllTabStates();
   process.exit(0);
 });
