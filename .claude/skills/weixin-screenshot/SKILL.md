@@ -32,7 +32,7 @@ mkdir -p /c/tmp && python .claude/skills/desktop/ctl_win.py screenshot C:/tmp/wx
 ```bash
 curl -s -X POST http://localhost:18080/weixin/send-media \
   -H "Content-Type: application/json" \
-  -d "{\"filePath\":\"C:/tmp/wx-screenshot.png\",\"text\":\"屏幕截图\"}"
+  -d "{\"filePath\":\"C:/tmp/wx-screenshot.png\"}"
 ```
 
 ## 结果处理
