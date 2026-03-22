@@ -178,6 +178,8 @@ export class HttpServer {
         this.handleEvents(req, res);
       } else if (url.pathname === "/status" && req.method === "GET") {
         await this.handleStatus(req, res);
+      } else if (url.pathname === "/weixin/send-media" && req.method === "POST") {
+        await this.handleWeixinSendMedia(req, res);
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Not Found" }));
@@ -687,6 +689,41 @@ export class HttpServer {
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(status));
+  }
+
+  /** 通过微信通道发送媒体文件（内部 API，仅 localhost） */
+  private async handleWeixinSendMedia(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // 仅允许 localhost 访问
+    const remote = req.socket.remoteAddress ?? "";
+    if (!remote.includes("127.0.0.1") && !remote.includes("::1") && !remote.includes("::ffff:127.0.0.1")) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "仅允许本机访问" }));
+      return;
+    }
+
+    if (!this.weixinChannel) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "微信通道未启动" }));
+      return;
+    }
+
+    const body = await this.readBody(req);
+    const { filePath, text } = JSON.parse(body) as { filePath: string; text?: string };
+
+    if (!filePath) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "缺少 filePath 参数" }));
+      return;
+    }
+
+    try {
+      await (this.weixinChannel as any).sendLastReply(text ?? "", filePath);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String(err) }));
+    }
   }
 
   /**
