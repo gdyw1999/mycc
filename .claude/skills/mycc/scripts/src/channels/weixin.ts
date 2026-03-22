@@ -10,6 +10,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { MessageChannel } from "./interface.js";
 import type { SSEEvent } from "../adapters/interface.js";
@@ -17,6 +18,7 @@ import type { SSEEvent } from "../adapters/interface.js";
 // ── 常量 ──────────────────────────────────────────────────────────────────
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
+const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const DEFAULT_BOT_TYPE = "3";
 const LONG_POLL_TIMEOUT_MS = 35_000;
 const API_TIMEOUT_MS = 15_000;
@@ -33,14 +35,26 @@ const MessageItemType = { NONE: 0, TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 
 const MessageType = { NONE: 0, USER: 1, BOT: 2 } as const;
 const MessageState = { NEW: 0, GENERATING: 1, FINISH: 2 } as const;
 
+interface CDNMedia {
+  encrypt_query_param?: string;
+  aes_key?: string;
+  encrypt_type?: number;
+}
+
 interface MessageItem {
   type?: number;
   text_item?: { text?: string };
-  image_item?: { media?: { encrypt_query_param?: string; aes_key?: string }; url?: string };
-  voice_item?: { media?: { encrypt_query_param?: string }; text?: string };
-  file_item?: { media?: { encrypt_query_param?: string }; file_name?: string };
-  video_item?: { media?: { encrypt_query_param?: string } };
+  image_item?: { media?: CDNMedia; url?: string; mid_size?: number };
+  voice_item?: { media?: CDNMedia; text?: string; playtime?: number };
+  file_item?: { media?: CDNMedia; file_name?: string; len?: string; md5?: string };
+  video_item?: { media?: CDNMedia; video_size?: number };
   ref_msg?: { message_item?: MessageItem; title?: string };
+}
+
+interface GetUploadUrlResp {
+  upload_param?: string;
+  thumb_upload_param?: string;
+  filekey?: string;
 }
 
 interface WeixinMessage {
@@ -105,22 +119,32 @@ function buildHeaders(opts: { token?: string; body: string }): Record<string, st
 async function apiFetch(params: {
   baseUrl: string;
   endpoint: string;
-  body: string;
+  body?: string;
   token?: string;
   timeoutMs: number;
   label: string;
+  method?: string;
 }): Promise<string> {
   const base = params.baseUrl.endsWith("/") ? params.baseUrl : `${params.baseUrl}/`;
   const url = new URL(params.endpoint, base);
-  const hdrs = buildHeaders({ token: params.token, body: params.body });
+  const method = params.method ?? "POST";
+  const isGet = method === "GET";
+
+  const headers: Record<string, string> = isGet
+    ? {
+        AuthorizationType: "ilink_bot_token",
+        "X-WECHAT-UIN": randomWechatUin(),
+        ...(params.token?.trim() ? { Authorization: `Bearer ${params.token.trim()}` } : {}),
+      }
+    : buildHeaders({ token: params.token, body: params.body ?? "" });
 
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), params.timeoutMs);
   try {
     const res = await fetch(url.toString(), {
-      method: "POST",
-      headers: hdrs,
-      body: params.body,
+      method,
+      headers,
+      ...(isGet ? {} : { body: params.body }),
       signal: controller.signal,
     });
     clearTimeout(t);
@@ -193,6 +217,231 @@ async function apiSendMessage(params: {
   return clientId;
 }
 
+// ── CDN 媒体操作 ─────────────────────────────────────────────────────────
+
+function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
+  const cipher = crypto.createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+function decryptAesEcb(ciphertext: Buffer, key: Buffer): Buffer {
+  const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+function detectExtByMagic(buf: Buffer): string {
+  if (buf.length < 4) return "";
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return ".jpg";
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return ".png";
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return ".gif";
+  if (buf[0] === 0x42 && buf[1] === 0x4D) return ".bmp";
+  if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[8] === 0x57 && buf[9] === 0x45) return ".webp";
+  if (buf.length >= 8 && buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return ".mp4";
+  if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return ".pdf";
+  return "";
+}
+
+/** 根据扩展名检测媒体类型：IMAGE=1, VIDEO=2, FILE=3 */
+function detectMediaType(filePath: string): number {
+  const ext = path.extname(filePath).toLowerCase();
+  if ([".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"].includes(ext)) return 1;
+  if ([".mp4", ".mov", ".avi", ".mkv"].includes(ext)) return 2;
+  return 3;
+}
+
+async function apiGetUploadUrl(params: {
+  baseUrl: string;
+  token: string;
+  uploadParams: Record<string, unknown>;
+}): Promise<GetUploadUrlResp> {
+  const rawText = await apiFetch({
+    baseUrl: params.baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify(params.uploadParams),
+    token: params.token,
+    timeoutMs: API_TIMEOUT_MS,
+    label: "getUploadUrl",
+  });
+  return JSON.parse(rawText);
+}
+
+/** 上传媒体文件到微信 CDN 并发送消息 */
+async function apiUploadMedia(params: {
+  baseUrl: string;
+  token: string;
+  toUser: string;
+  contextToken: string;
+  filePath: string;
+}): Promise<void> {
+  const { baseUrl, token, toUser, contextToken, filePath } = params;
+
+  // 1. 读取文件
+  const fileData = fs.readFileSync(filePath);
+  const rawsize = fileData.length;
+  const rawfilemd5 = crypto.createHash("md5").update(fileData).digest("hex");
+
+  // 2. 生成 AES key 并检测媒体类型
+  const aesKey = crypto.randomBytes(16);
+  const mediaType = detectMediaType(filePath);
+
+  // 3. 加密文件
+  const ciphertext = encryptAesEcb(fileData, aesKey);
+
+  // 4. 构造 filekey
+  const extname = path.extname(filePath);
+  const rand = crypto.randomBytes(3).toString("hex");
+  const filekey = `mycc-wx-${Date.now()}-${rand}${extname}`;
+
+  // 5. 获取上传地址
+  const uploadResp = await apiGetUploadUrl({
+    baseUrl,
+    token,
+    uploadParams: {
+      filekey,
+      media_type: mediaType,
+      to_user_id: toUser,
+      rawsize,
+      rawfilemd5,
+      filesize: ciphertext.length,
+      no_need_thumb: true,
+      aeskey: aesKey.toString("hex"),
+      base_info: { channel_version: "0.1.0" },
+    },
+  });
+
+  const uploadParam = uploadResp.upload_param ?? "";
+  const serverFilekey = uploadResp.filekey ?? filekey;
+
+  // 6. 上传到 CDN
+  const cdnUrl =
+    `${CDN_BASE_URL}/upload` +
+    `?encrypted_query_param=${encodeURIComponent(uploadParam)}` +
+    `&filekey=${encodeURIComponent(serverFilekey)}`;
+
+  const authHeaders = buildHeaders({ token, body: "" });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+
+  let downloadParam: string;
+  try {
+    const cdnResp = await fetch(cdnUrl, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "Content-Type": "application/octet-stream",
+      },
+      body: new Uint8Array(ciphertext) as unknown as BodyInit,
+      signal: controller.signal,
+    });
+    if (!cdnResp.ok) {
+      const errText = await cdnResp.text();
+      throw new Error(`[uploadMedia] CDN HTTP ${cdnResp.status}: ${errText}`);
+    }
+    downloadParam = cdnResp.headers.get("x-encrypted-param") ?? "";
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // 7. 构造媒体信息
+  const aesKeyBase64 = Buffer.from(aesKey.toString("hex")).toString("base64");
+  const mediaInfo: CDNMedia = {
+    encrypt_query_param: downloadParam,
+    aes_key: aesKeyBase64,
+    encrypt_type: 1,
+  };
+
+  // 8. 根据媒体类型构造 MessageItem
+  let mediaItem: Record<string, unknown>;
+  if (mediaType === 1) {
+    mediaItem = { type: MessageItemType.IMAGE, image_item: { media: mediaInfo, mid_size: ciphertext.length } };
+  } else if (mediaType === 2) {
+    mediaItem = { type: MessageItemType.VIDEO, video_item: { media: mediaInfo, video_size: ciphertext.length } };
+  } else {
+    mediaItem = {
+      type: MessageItemType.FILE,
+      file_item: {
+        media: mediaInfo,
+        file_name: path.basename(filePath),
+        len: String(rawsize),
+        md5: rawfilemd5,
+      },
+    };
+  }
+
+  // 9. 发送消息
+  const clientId = `mycc-wx-${crypto.randomUUID()}`;
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: toUser,
+        client_id: clientId,
+        message_type: MessageType.BOT,
+        message_state: MessageState.FINISH,
+        item_list: [mediaItem],
+        context_token: contextToken,
+      },
+    }),
+    token,
+    timeoutMs: API_TIMEOUT_MS,
+    label: "uploadMedia",
+  });
+}
+
+/** 从微信 CDN 下载并解密媒体文件 */
+async function apiDownloadMedia(params: {
+  encryptQueryParam: string;
+  aesKeyBase64: string;
+  outDir?: string;
+  fileName?: string;
+}): Promise<string> {
+  const { encryptQueryParam, aesKeyBase64, outDir, fileName } = params;
+
+  // 1. 构造下载 URL
+  const downloadUrl =
+    `${CDN_BASE_URL}/download` +
+    `?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+
+  // 2. 下载密文
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+
+  let ciphertext: Buffer;
+  try {
+    const resp = await fetch(downloadUrl, { signal: controller.signal });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`[downloadMedia] CDN HTTP ${resp.status}: ${errText}`);
+    }
+    ciphertext = Buffer.from(await resp.arrayBuffer());
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // 3. 解码 AES key（base64 → hex string → 16 字节 key）
+  const hexStr = Buffer.from(aesKeyBase64, "base64").toString("utf-8");
+  const aesKey = Buffer.from(hexStr, "hex");
+
+  // 4. 解密
+  const plaintext = decryptAesEcb(ciphertext, aesKey);
+
+  // 5. 通过文件头检测类型并保存
+  const ext = detectExtByMagic(plaintext);
+  const targetDir = outDir ?? path.join(os.tmpdir(), "mycc-weixin", "media");
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  let targetName = fileName ?? `media-${Date.now()}`;
+  if (!path.extname(targetName) && ext) {
+    targetName += ext;
+  }
+  const targetPath = path.join(targetDir, targetName);
+  fs.writeFileSync(targetPath, plaintext);
+
+  return path.resolve(targetPath);
+}
+
 // ── QR 登录 ───────────────────────────────────────────────────────────────
 
 async function fetchQRCode(apiBaseUrl: string): Promise<{ qrcode: string; qrcodeUrl: string }> {
@@ -238,27 +487,6 @@ async function pollQRStatus(apiBaseUrl: string, qrcode: string): Promise<{
 }
 
 // ── 消息解析 ──────────────────────────────────────────────────────────────
-
-function extractTextFromItems(itemList?: MessageItem[]): string {
-  if (!itemList?.length) return "";
-  for (const item of itemList) {
-    if (item.type === MessageItemType.TEXT && item.text_item?.text != null) {
-      const text = String(item.text_item.text);
-      const ref = item.ref_msg;
-      if (!ref) return text;
-      const parts: string[] = [];
-      if (ref.title) parts.push(ref.title);
-      if (ref.message_item?.text_item?.text) parts.push(ref.message_item.text_item.text);
-      if (!parts.length) return text;
-      return `[引用: ${parts.join(" | ")}]\n${text}`;
-    }
-    // 语音转文字
-    if (item.type === MessageItemType.VOICE && item.voice_item?.text) {
-      return item.voice_item.text;
-    }
-  }
-  return "";
-}
 
 /** 去除 markdown 格式（微信纯文本） */
 function stripMarkdown(text: string): string {
@@ -440,21 +668,24 @@ export class WeixinChannel implements MessageChannel {
 
   /**
    * 发送回复给最近消息的发送者
+   * @param text - 回复文本
+   * @param media - 可选：本地文件绝对路径，发送图片/视频/文件
    */
-  async sendLastReply(text: string): Promise<void> {
+  async sendLastReply(text: string, media?: string): Promise<void> {
     if (!this.lastFromUserId) {
       console.warn("[WeixinChannel] 无法回复：没有最近的发送者");
       return;
     }
-    await this.sendReply(this.lastFromUserId, text);
+    await this.sendReply(this.lastFromUserId, text, media);
   }
 
   /**
    * 发送回复到微信用户
    * @param to - 微信用户 ID
    * @param text - 回复文本（会自动去除 markdown）
+   * @param media - 可选：本地文件绝对路径，发送图片/视频/文件
    */
-  async sendReply(to: string, text: string): Promise<void> {
+  async sendReply(to: string, text: string, media?: string): Promise<void> {
     if (!this.account?.token) {
       throw new Error("微信未登录");
     }
@@ -463,14 +694,41 @@ export class WeixinChannel implements MessageChannel {
       console.warn(`[WeixinChannel] 无法回复 ${to}：缺少 contextToken`);
       return;
     }
-    const plainText = stripMarkdown(text);
-    await apiSendMessage({
-      baseUrl: this.account.baseUrl || DEFAULT_BASE_URL,
-      token: this.account.token,
-      to,
-      text: plainText,
-      contextToken,
-    });
+
+    const baseUrl = this.account.baseUrl || DEFAULT_BASE_URL;
+    const token = this.account.token;
+
+    // 发送文本消息
+    if (text) {
+      const plainText = stripMarkdown(text);
+      await apiSendMessage({
+        baseUrl,
+        token,
+        to,
+        text: plainText,
+        contextToken,
+      });
+    }
+
+    // 发送媒体文件
+    if (media) {
+      if (!fs.existsSync(media)) {
+        console.warn(`[WeixinChannel] 媒体文件不存在: ${media}`);
+        return;
+      }
+      try {
+        await apiUploadMedia({
+          baseUrl,
+          token,
+          toUser: to,
+          contextToken,
+          filePath: media,
+        });
+        console.log(`[WeixinChannel] 媒体文件已发送: ${path.basename(media)}`);
+      } catch (err) {
+        console.error(`[WeixinChannel] 媒体发送失败:`, err);
+      }
+    }
   }
 
   // ── 内部：long-poll 监听循环 ──
@@ -558,30 +816,88 @@ export class WeixinChannel implements MessageChannel {
 
   private async processInboundMessage(msg: WeixinMessage): Promise<void> {
     const fromUserId = msg.from_user_id ?? "";
-    const text = extractTextFromItems(msg.item_list);
+    const parts: string[] = [];
 
-    if (!text && !msg.item_list?.some(i =>
-      i.type === MessageItemType.IMAGE ||
-      i.type === MessageItemType.VOICE ||
-      i.type === MessageItemType.FILE ||
-      i.type === MessageItemType.VIDEO
-    )) {
-      return; // 空消息
+    // 提取各类型消息内容（支持媒体下载）
+    for (const item of msg.item_list ?? []) {
+      const t = item.type ?? 0;
+
+      if (t === MessageItemType.TEXT) {
+        const textContent = item.text_item?.text;
+        if (textContent) {
+          const ref = item.ref_msg;
+          if (ref) {
+            const refParts: string[] = [];
+            if (ref.title) refParts.push(ref.title);
+            if (ref.message_item?.text_item?.text) refParts.push(ref.message_item.text_item.text);
+            if (refParts.length) parts.push(`[引用: ${refParts.join(" | ")}]`);
+          }
+          parts.push(textContent);
+        }
+      } else if (t === MessageItemType.IMAGE) {
+        let desc = "[图片]";
+        if (item.image_item?.media?.encrypt_query_param && item.image_item?.media?.aes_key) {
+          try {
+            const filePath = await apiDownloadMedia({
+              encryptQueryParam: item.image_item.media.encrypt_query_param,
+              aesKeyBase64: item.image_item.media.aes_key,
+            });
+            desc += `\n[附件: ${filePath}]`;
+          } catch {
+            // 下载失败不阻塞
+          }
+        }
+        parts.push(desc);
+      } else if (t === MessageItemType.VOICE) {
+        parts.push(`[语音] ${item.voice_item?.text ?? ""}`);
+      } else if (t === MessageItemType.FILE) {
+        let desc = `[文件: ${item.file_item?.file_name ?? "unknown"}]`;
+        if (item.file_item?.media?.encrypt_query_param && item.file_item?.media?.aes_key) {
+          try {
+            const filePath = await apiDownloadMedia({
+              encryptQueryParam: item.file_item.media.encrypt_query_param,
+              aesKeyBase64: item.file_item.media.aes_key,
+              fileName: item.file_item.file_name,
+            });
+            desc += `\n[附件: ${filePath}]`;
+          } catch {
+            // 下载失败不阻塞
+          }
+        }
+        parts.push(desc);
+      } else if (t === MessageItemType.VIDEO) {
+        let desc = "[视频]";
+        if (item.video_item?.media?.encrypt_query_param && item.video_item?.media?.aes_key) {
+          try {
+            const filePath = await apiDownloadMedia({
+              encryptQueryParam: item.video_item.media.encrypt_query_param,
+              aesKeyBase64: item.video_item.media.aes_key,
+            });
+            desc += `\n[附件: ${filePath}]`;
+          } catch {
+            // 下载失败不阻塞
+          }
+        }
+        parts.push(desc);
+      }
     }
+
+    const fullText = parts.join("\n") || "";
+    if (!fullText) return;
 
     // 缓存 contextToken
     if (msg.context_token) {
       this.contextTokenStore.set(fromUserId, msg.context_token);
     }
 
-    console.log(`[WeixinChannel] 收到消息 from=${fromUserId}: ${text.substring(0, 50)}${text.length > 50 ? "..." : ""}`);
+    console.log(`[WeixinChannel] 收到消息 from=${fromUserId}: ${fullText.substring(0, 50)}${fullText.length > 50 ? "..." : ""}`);
 
     // 记录最近发送者
     this.lastFromUserId = fromUserId;
 
     // 触发消息回调
-    if (this.messageCallback && text) {
-      this.messageCallback(text);
+    if (this.messageCallback) {
+      this.messageCallback(fullText);
     }
   }
 
