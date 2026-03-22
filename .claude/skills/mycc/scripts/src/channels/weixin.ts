@@ -293,6 +293,7 @@ async function apiUploadMedia(params: {
   const filekey = `mycc-wx-${Date.now()}-${rand}${extname}`;
 
   // 5. 获取上传地址
+  console.log(`[uploadMedia] 文件: ${path.basename(filePath)}, 大小: ${rawsize}, 加密后: ${ciphertext.length}, 类型: ${mediaType}`);
   const uploadResp = await apiGetUploadUrl({
     baseUrl,
     token,
@@ -308,6 +309,7 @@ async function apiUploadMedia(params: {
       base_info: { channel_version: "0.1.0" },
     },
   });
+  console.log(`[uploadMedia] getUploadUrl 响应:`, JSON.stringify(uploadResp));
 
   const uploadParam = uploadResp.upload_param ?? "";
   const serverFilekey = uploadResp.filekey ?? filekey;
@@ -318,7 +320,6 @@ async function apiUploadMedia(params: {
     `?encrypted_query_param=${encodeURIComponent(uploadParam)}` +
     `&filekey=${encodeURIComponent(serverFilekey)}`;
 
-  const authHeaders = buildHeaders({ token, body: "" });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
 
@@ -327,10 +328,13 @@ async function apiUploadMedia(params: {
     const cdnResp = await fetch(cdnUrl, {
       method: "POST",
       headers: {
-        ...authHeaders,
         "Content-Type": "application/octet-stream",
+        AuthorizationType: "ilink_bot_token",
+        "X-WECHAT-UIN": randomWechatUin(),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        "Content-Length": String(ciphertext.length),
       },
-      body: new Uint8Array(ciphertext) as unknown as BodyInit,
+      body: ciphertext,
       signal: controller.signal,
     });
     if (!cdnResp.ok) {
@@ -338,6 +342,7 @@ async function apiUploadMedia(params: {
       throw new Error(`[uploadMedia] CDN HTTP ${cdnResp.status}: ${errText}`);
     }
     downloadParam = cdnResp.headers.get("x-encrypted-param") ?? "";
+    console.log(`[uploadMedia] CDN 上传成功, downloadParam长度: ${downloadParam.length}`);
   } finally {
     clearTimeout(timer);
   }
