@@ -32,6 +32,7 @@ build/
 # MyCC 运行时文件（不应提交）
 # ====================================
 .claude/skills/mycc/current.json
+.claude/skills/mycc/weixin/
 .claude/skills/mycc/*.log
 .claude/skills/mycc/scripts/*.log
 .claude/skills/mycc/scripts/dist/
