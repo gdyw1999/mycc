@@ -20,6 +20,7 @@ import { loadConfig } from "./config.js";
 import { SessionStats } from "./session-stats.js";
 import { FeishuCommands } from "./channels/feishu-commands.js";
 import { resolveAgentDir, listAgents } from "./agent-resolver.js";
+import type { WeixinChannel } from "./channels/weixin.js";
 
 const PORT = process.env.PORT || 18080;
 
@@ -45,6 +46,7 @@ export class HttpServer {
   private isTls: boolean;
   private channelManager: ChannelManager;
   private feishuChannel: any = null;
+  private weixinChannel: WeixinChannel | null = null;
   private feishuCommands: FeishuCommands;
   private stats: SessionStats;
 
@@ -176,6 +178,8 @@ export class HttpServer {
         this.handleEvents(req, res);
       } else if (url.pathname === "/status" && req.method === "GET") {
         await this.handleStatus(req, res);
+      } else if (url.pathname === "/weixin/send-media" && req.method === "POST") {
+        await this.handleWeixinSendMedia(req, res);
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Not Found" }));
@@ -687,6 +691,41 @@ export class HttpServer {
     res.end(JSON.stringify(status));
   }
 
+  /** 通过微信通道发送媒体文件（内部 API，仅 localhost） */
+  private async handleWeixinSendMedia(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // 仅允许 localhost 访问
+    const remote = req.socket.remoteAddress ?? "";
+    if (!remote.includes("127.0.0.1") && !remote.includes("::1") && !remote.includes("::ffff:127.0.0.1")) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "仅允许本机访问" }));
+      return;
+    }
+
+    if (!this.weixinChannel) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "微信通道未启动" }));
+      return;
+    }
+
+    const body = await this.readBody(req);
+    const { filePath, text } = JSON.parse(body) as { filePath: string; text?: string };
+
+    if (!filePath) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "缺少 filePath 参数" }));
+      return;
+    }
+
+    try {
+      await (this.weixinChannel as any).sendLastReply(text ?? "", filePath);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String(err) }));
+    }
+  }
+
   /**
    * 向所有连接广播心跳
    */
@@ -773,6 +812,55 @@ export class HttpServer {
           }
         } else {
           console.log("[Channels] 飞书通道未配置");
+        }
+
+        // 动态加载并注册微信通道（如果已登录）
+        if (process.env.CHANNEL_WEIXIN !== "false") {
+          try {
+            const { WeixinChannel } = await import("./channels/weixin.js");
+            const stateDir = join(this.cwd, ".claude", "skills", "mycc");
+            this.weixinChannel = new WeixinChannel({ stateDir });
+
+            if (this.weixinChannel.isLoggedIn()) {
+              this.weixinChannel.onMessage(async (message: string) => {
+                // 微信消息路由到 CC
+                console.log(`[WeixinChannel] 转发消息到 CC: ${message.substring(0, 50)}...`);
+                try {
+                  const chunks: string[] = [];
+                  for await (const data of adapter.chat({ message, cwd: this.cwd })) {
+                    // 收集 assistant 回复文本
+                    if (data && typeof data === "object" && "type" in data) {
+                      if (data.type === "assistant" && "message" in data) {
+                        const msg = (data as any).message;
+                        if (msg?.content && Array.isArray(msg.content)) {
+                          for (const block of msg.content) {
+                            if (block?.type === "text" && block.text) {
+                              chunks.push(block.text);
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                  // 发送完整回复
+                  if (chunks.length > 0 && this.weixinChannel) {
+                    const fullReply = chunks.join("");
+                    // 获取最近一个发消息的用户（从 channel 内部获取）
+                    await (this.weixinChannel as any).sendLastReply(fullReply);
+                  }
+                } catch (err) {
+                  console.error("[WeixinChannel] 处理消息失败:", err);
+                }
+              });
+
+              this.channelManager.register(this.weixinChannel);
+              console.log("[Channels] 微信通道已注册");
+            } else {
+              console.log("[Channels] 微信通道未登录，跳过（使用 /mycc-weixin 登录）");
+            }
+          } catch (err) {
+            console.warn("[Channels] 微信通道加载失败:", err);
+          }
         }
 
         // 启动所有通道（包括飞书长连接）
