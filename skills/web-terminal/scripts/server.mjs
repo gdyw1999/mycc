@@ -191,7 +191,7 @@ function persistRuntimeTabs() {
 }
 
 function loadPersistedRuntimeTabs() {
-  if (!fs.existsSync(RUNTIME_TABS_PATH)) return { defaultLabels: {}, runtimeTabs: [] };
+  if (!fs.existsSync(RUNTIME_TABS_PATH)) return [];
   try {
     const raw = fs.readFileSync(RUNTIME_TABS_PATH, 'utf8');
     const parsed = JSON.parse(raw);
@@ -352,13 +352,12 @@ function spawnTab(ws, tabId, cols, rows) {
   }
 
   try {
-    const ptyEnv = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
     state.pty = pty.spawn(spawnCmd, spawnArgs, {
       name: 'xterm-256color',
       cols: initialSize.cols,
       rows: initialSize.rows,
       cwd: CWD,
-      env: ptyEnv,
+      env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
     });
 
     state.status = 'running';
