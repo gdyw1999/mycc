@@ -25,22 +25,28 @@ WEB_TERMINAL_TOKEN=mycc node .claude/skills/web-terminal/scripts/server.mjs
 
 > 用 `run_in_background=true`，等服务启动后继续。
 
-### 2. 启动 cloudflared 穿透（后台运行）
+### 2. 检查 frp 隧道状态
 
-```bash
-cloudflared tunnel --url http://127.0.0.1:7681 2>&1
+Web Terminal 通过 **frp** 隧道提供服务，确保 frpc 客户端已启动并包含以下配置：
+
+```toml
+[[proxies]]
+name = "web-terminal-tcp"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 7681
+remotePort = 7681
 ```
-
-> 也用 `run_in_background=true`，从输出中提取形如 `https://xxx.trycloudflare.com` 的 URL。
 
 ### 3. 告知用户访问链接
 
-访问地址就是 cloudflared 的根 URL，打开后有登录页，输入 token 进入终端。
+| 访问方式 | 地址 |
+|---------|------|
+| **外网（域名）** | http://8027.linbaobao.net |
+| **外网（IP）** | http://101.126.93.180:7681 |
+| **本地** | http://127.0.0.1:7681 |
 
-外网：`{cloudflared_url}`
-本地：`http://127.0.0.1:7681`
-
-Token 不出现在 URL 里，在登录页输入即可。
+Token 不出现在 URL 里，在登录页输入即可（默认：`mycc`）。
 
 ## 功能特性
 
@@ -55,7 +61,7 @@ Token 不出现在 URL 里，在登录页输入即可。
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `WEB_TERMINAL_PORT` | 7681 | 监听端口 |
-| `WEB_TERMINAL_TOKEN` | 随机 | 建议固定为 `mycc` 方便记忆 |
+| `WEB_TERMINAL_TOKEN` | 随机 | 当前使用 `KJ7HI0` |
 | `WEB_TERMINAL_CWD` | 当前目录 | 工作目录 |
 | `WEB_TERMINAL_TABS` | 内置默认标签页 | JSON 自定义标签页配置 |
 

@@ -10,10 +10,22 @@ import pty from 'node-pty';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 
 const PORT = parseInt(process.env.WEB_TERMINAL_PORT || '7681');
 const TOKEN = process.env.WEB_TERMINAL_TOKEN || crypto.randomBytes(12).toString('hex');
-const CWD = process.env.WEB_TERMINAL_CWD || process.cwd();
+// 自动查找项目根目录（向上查找 .claude 目录或 claude.md）
+function findProjectRoot(startDir) {
+  let dir = startDir;
+  while (dir !== path.parse(dir).root) {
+    if (fs.existsSync(path.join(dir, '.claude')) || fs.existsSync(path.join(dir, 'claude.md'))) {
+      return dir;
+    }
+    dir = path.dirname(dir);
+  }
+  return startDir;
+}
+const CWD = process.env.WEB_TERMINAL_CWD || findProjectRoot(process.cwd());
 const MAX_SCROLLBACK = 50 * 1024;
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024; // 50MB
 const RUNTIME_TABS_PATH = path.resolve(CWD, '.claude', 'skills', 'web-terminal', 'runtime-tabs.json');
@@ -889,8 +901,8 @@ var isStandalonePwa = (window.matchMedia && window.matchMedia('(display-mode: st
   || window.navigator.standalone === true;
 if (isStandalonePwa) document.documentElement.setAttribute('data-display-mode', 'standalone');
 
-var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-  || (window.matchMedia('(pointer: coarse)').matches && window.innerWidth <= 768);
+var isMobile = /Android|iPhone|iPad|iPod|HarmonyOS/i.test(navigator.userAgent)
+  || (window.matchMedia('(pointer: coarse)').matches && window.innerWidth <= 768 && !/Windows/i.test(navigator.userAgent));
 var isIOS = /iPad|iPhone|iPod/i.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
